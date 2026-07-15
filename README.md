@@ -1,2 +1,2 @@
-# nexus-bot-Backend
+# nexus-bot-v2
 Nexus Bot Ai trading Backend
