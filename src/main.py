@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from bot_engine import scheduler_manager
+from src.bot_engine import scheduler_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,7 +35,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from routers import auth, dashboard, exchanges, payments, users, admin, signals, trades
+from src.routers import auth, dashboard, exchanges, payments, users, admin, signals, trades
 
 app.include_router(auth.router,       prefix="/api/auth",      tags=["auth"])
 app.include_router(dashboard.router,  prefix="/api/dashboard", tags=["dashboard"])
@@ -48,8 +48,8 @@ app.include_router(trades.router,     prefix="/api/trades",    tags=["trades"])
 
 # ── Bot endpoints ─────────────────────────────────────────────────────────────
 from pydantic import BaseModel
-from database import get_db, User, Trade, TradeStatus
-from routers.auth import get_current_user
+from src.database import get_db, User, Trade, TradeStatus
+from src.routers.auth import get_current_user
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
