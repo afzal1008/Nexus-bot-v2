@@ -1,5 +1,6 @@
 """
 Nexus Bot - Main FastAPI Application
+Auto-creates database tables on startup
 """
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +15,16 @@ from bot_engine import scheduler_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Auto-create database tables
+    logger.info("Creating database tables...")
+    try:
+        from database import init_db
+        await init_db()
+        logger.info("Database tables ready")
+    except Exception as e:
+        logger.error(f"DB init error: {e}")
+
+    # Start bot scheduler
     logger.info("Starting Nexus Bot...")
     scheduler = AsyncIOScheduler()
     scheduler_manager.start(scheduler)
