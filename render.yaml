@@ -2,10 +2,6 @@ services:
   - type: web
     name: nexus-bot-v2
     env: python
+    pythonVersion: "3.11.0"
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: SECRET_KEY
-        sync: false
+    startCommand: cd src && uvicorn main:app --host 0.0.0.0 --port $PORT
