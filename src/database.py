@@ -13,9 +13,10 @@ import enum
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost/nexusbot")
-# Render provides postgres:// — convert to postgresql+asyncpg://
 DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True, connect_args={})
+DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
