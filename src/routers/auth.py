@@ -10,7 +10,7 @@ from database import get_db, User, PlanType
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from passlib.hash import bcrypt
+import hashlib
 import os
 import logging
 
@@ -21,15 +21,20 @@ SECRET_KEY = os.getenv("SECRET_KEY", "nexus-bot-secret-key-2024")
 ALGORITHM = "HS256"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
+
 def hash_password(password: str) -> str:
-    return bcrypt.hash(password[:72])
+    """SHA256 hash - no length limit"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.verify(plain[:72], hashed)
+    return hashlib.sha256(plain.encode()).hexdigest() == hashed
+
 
 def create_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(days=30)
     return jwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -50,14 +55,17 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+
 class RegisterRequest(BaseModel):
     email: str
     password: str
     full_name: str
 
+
 class LoginRequest(BaseModel):
     email: str
     password: str
+
 
 def user_to_dict(user: User, token: str = None):
     data = {
@@ -72,8 +80,10 @@ def user_to_dict(user: User, token: str = None):
     if token:
         data["access_token"] = token
         data["token_type"] = "bearer"
-        data["user"] = {k: v for k, v in data.items() if k not in ["access_token","token_type"]}
+        data["user"] = {k: v for k, v in data.items()
+                        if k not in ["access_token", "token_type"]}
     return data
+
 
 @router.post("/register")
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
@@ -103,6 +113,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         logger.error(f"Register error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/login")
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     try:
@@ -119,9 +130,11 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         logger.error(f"Login error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
     return user_to_dict(current_user)
+
 
 @router.put("/me")
 async def update_me(
