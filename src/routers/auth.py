@@ -1,5 +1,5 @@
 """
-Auth Router - Login, Register, Me
+Auth Router
 File: src/routers/auth.py
 """
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,9 +9,8 @@ from sqlalchemy import select
 from database import get_db, User, PlanType
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+from passlib.hash import bcrypt
 import os
 import logging
 
@@ -20,24 +19,17 @@ router = APIRouter()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "nexus-bot-secret-key-2024")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 30
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt_truncate_error=False)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
-
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password[:72])
-
+    return bcrypt.hash(password[:72])
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain[:72], hashed)
-
+    return bcrypt.verify(plain[:72], hashed)
 
 def create_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    expire = datetime.utcnow() + timedelta(days=30)
     return jwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
-
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -58,17 +50,14 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
-
 class RegisterRequest(BaseModel):
     email: str
     password: str
     full_name: str
 
-
 class LoginRequest(BaseModel):
     email: str
     password: str
-
 
 def user_to_dict(user: User, token: str = None):
     data = {
@@ -83,24 +72,19 @@ def user_to_dict(user: User, token: str = None):
     if token:
         data["access_token"] = token
         data["token_type"] = "bearer"
-        data["user"] = {k: v for k, v in data.items() if k not in ["access_token", "token_type"]}
+        data["user"] = {k: v for k, v in data.items() if k not in ["access_token","token_type"]}
     return data
-
 
 @router.post("/register")
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     try:
-        # Check existing user
         result = await db.execute(select(User).where(User.email == body.email))
-        existing = result.scalar_one_or_none()
-        if existing:
+        if result.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Email already registered")
-
-        # Create user
         user = User(
             email=body.email,
             full_name=body.full_name,
-            hashed_password=hash_password(body.password[:72]),
+            hashed_password=hash_password(body.password),
             plan=PlanType.pro,
             is_active=True,
             is_verified=True,
@@ -110,43 +94,34 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         db.add(user)
         await db.commit()
         await db.refresh(user)
-
         token = create_token(user.id)
-        logger.info(f"New user registered: {user.email}")
+        logger.info(f"Registered: {user.email}")
         return user_to_dict(user, token)
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Register error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/login")
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     try:
         result = await db.execute(select(User).where(User.email == body.email))
         user = result.scalar_one_or_none()
-        if not user or not user.hashed_password:
+        if not user or not verify_password(body.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        if not verify_password(body.password, user.hashed_password):
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account disabled")
         token = create_token(user.id)
-        logger.info(f"User logged in: {user.email}")
+        logger.info(f"Login: {user.email}")
         return user_to_dict(user, token)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Login error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
     return user_to_dict(current_user)
-
 
 @router.put("/me")
 async def update_me(
