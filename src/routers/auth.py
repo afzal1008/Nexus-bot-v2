@@ -27,7 +27,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=Fals
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return pwd_context.hash(password[:72])
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -100,7 +100,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         user = User(
             email=body.email,
             full_name=body.full_name,
-            hashed_password=hash_password(body.password),
+            hashed_password=hash_password(body.password[:72]),
             plan=PlanType.pro,
             is_active=True,
             is_verified=True,
