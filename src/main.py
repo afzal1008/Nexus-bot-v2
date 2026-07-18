@@ -1,9 +1,9 @@
 """
 Nexus Bot - Main FastAPI Application
-Auto-creates database tables on startup
 """
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
@@ -15,7 +15,6 @@ from bot_engine import scheduler_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create database tables
     logger.info("Creating database tables...")
     try:
         from database import init_db
@@ -23,8 +22,6 @@ async def lifespan(app: FastAPI):
         logger.info("Database tables ready")
     except Exception as e:
         logger.error(f"DB init error: {e}")
-
-    # Start bot scheduler
     logger.info("Starting Nexus Bot...")
     scheduler = AsyncIOScheduler()
     scheduler_manager.start(scheduler)
@@ -36,19 +33,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Nexus Bot API", version="2.0", lifespan=lifespan)
 
+# CORS - allow all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://afzal1008.github.io",
-        "http://localhost:3000",
-        "http://localhost:8080",
-        "*"
-    ],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
+
+# Handle OPTIONS preflight requests explicitly
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(request: Request, rest_of_path: str):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 from routers import auth, dashboard, exchanges, payments, users, admin, signals, trades
 
@@ -80,7 +84,6 @@ async def bot_settings(
     current_user.bot_enabled = body.bot_enabled
     current_user.trade_amount_usdt = max(5.0, min(body.trade_amount_usdt, 10000.0))
     await db.commit()
-    logger.info(f"Bot {'ENABLED' if body.bot_enabled else 'DISABLED'} for {current_user.email}")
     return {
         "status": "success",
         "bot_enabled": current_user.bot_enabled,
