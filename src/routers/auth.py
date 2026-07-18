@@ -2,7 +2,7 @@
 Auth Router - Login, Register, Me
 File: src/routers/auth.py
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -13,11 +13,12 @@ from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── Security ──────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "nexus-bot-super-secret-key-2024-change-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY", "nexus-bot-secret-key-2024")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
@@ -51,7 +52,6 @@ async def get_current_user(
             raise HTTPException(status_code=401, detail="Invalid token")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -59,7 +59,6 @@ async def get_current_user(
     return user
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     email: str
     password: str
@@ -71,8 +70,8 @@ class LoginRequest(BaseModel):
     password: str
 
 
-def user_response(user: User, token: str = None):
-    resp = {
+def user_to_dict(user: User, token: str = None):
+    data = {
         "id": user.id,
         "email": user.email,
         "full_name": user.full_name,
@@ -80,65 +79,73 @@ def user_response(user: User, token: str = None):
         "bot_enabled": user.bot_enabled,
         "trade_amount_usdt": float(user.trade_amount_usdt or 10.0),
         "is_active": user.is_active,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
     }
     if token:
-        resp["access_token"] = token
-        resp["token_type"] = "bearer"
-        resp["user"] = resp.copy()
-        resp["user"].pop("access_token", None)
-        resp["user"].pop("token_type", None)
-        resp["user"].pop("user", None)
-    return resp
+        data["access_token"] = token
+        data["token_type"] = "bearer"
+        data["user"] = {k: v for k, v in data.items() if k not in ["access_token", "token_type"]}
+    return data
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @router.post("/register")
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check existing
-    result = await db.execute(select(User).where(User.email == body.email))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already registered")
+    try:
+        # Check existing user
+        result = await db.execute(select(User).where(User.email == body.email))
+        existing = result.scalar_one_or_none()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
 
-    user = User(
-        email=body.email,
-        full_name=body.full_name,
-        hashed_password=hash_password(body.password),
-        plan=PlanType.pro,  # Default to pro for testing
-        is_active=True,
-        is_verified=True,
-        bot_enabled=False,
-        trade_amount_usdt=10.0,
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
+        # Create user
+        user = User(
+            email=body.email,
+            full_name=body.full_name,
+            hashed_password=hash_password(body.password),
+            plan=PlanType.pro,
+            is_active=True,
+            is_verified=True,
+            bot_enabled=False,
+            trade_amount_usdt=10.0,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
 
-    token = create_token(user.id)
-    return user_response(user, token)
+        token = create_token(user.id)
+        logger.info(f"New user registered: {user.email}")
+        return user_to_dict(user, token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Register error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 
 @router.post("/login")
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == body.email))
-    user = result.scalar_one_or_none()
-
-    if not user or not user.hashed_password:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    if not verify_password(body.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account is disabled")
-
-    token = create_token(user.id)
-    return user_response(user, token)
+    try:
+        result = await db.execute(select(User).where(User.email == body.email))
+        user = result.scalar_one_or_none()
+        if not user or not user.hashed_password:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        if not verify_password(body.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account disabled")
+        token = create_token(user.id)
+        logger.info(f"User logged in: {user.email}")
+        return user_to_dict(user, token)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
-    return user_response(current_user)
+    return user_to_dict(current_user)
 
 
 @router.put("/me")
@@ -152,4 +159,4 @@ async def update_me(
     if "password" in body and body["password"]:
         current_user.hashed_password = hash_password(body["password"])
     await db.commit()
-    return user_response(current_user)
+    return user_to_dict(current_user)
