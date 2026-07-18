@@ -1,6 +1,6 @@
 """
 Bot Engine - Runs every 30 seconds
-Fetches real candle data from Binance public API, generates signals, saves to DB
+Uses CoinGecko API (works in UAE, no restrictions)
 """
 import logging
 import httpx
@@ -10,9 +10,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Trading pairs to monitor
-PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+PAIRS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+
+COINGECKO_IDS = {
+    "BTC/USDT": "bitcoin",
+    "ETH/USDT": "ethereum",
+    "BNB/USDT": "binancecoin",
+    "SOL/USDT": "solana",
+    "XRP/USDT": "ripple"
+}
 
 
 class SchedulerManager:
@@ -30,18 +36,20 @@ class SchedulerManager:
         )
         logger.info("✅ Bot scheduler started - 30 second interval")
 
+
 scheduler_manager = SchedulerManager()
 
 
-async def fetch_candles(symbol: str, limit: int = 50) -> list:
-    """Fetch OHLCV candles from Binance public API - no auth needed"""
+async def fetch_candles(symbol: str) -> list:
+    """Fetch OHLC data from CoinGecko - works everywhere"""
+    coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(BINANCE_URL, params={
-                "symbol": symbol,
-                "interval": "1h",
-                "limit": limit
-            })
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Get 30 days of daily OHLC
+            resp = await client.get(
+                f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
+                params={"vs_currency": "usd", "days": "30"}
+            )
             resp.raise_for_status()
             raw = resp.json()
             candles = [
@@ -51,14 +59,32 @@ async def fetch_candles(symbol: str, limit: int = 50) -> list:
                     "high":   float(c[2]),
                     "low":    float(c[3]),
                     "close":  float(c[4]),
-                    "volume": float(c[5]),
+                    "volume": 1000000.0  # CoinGecko OHLC doesn't include volume
                 }
                 for c in raw
             ]
+            logger.info(f"✅ Fetched {len(candles)} candles for {symbol}")
             return candles
     except Exception as e:
-        logger.warning(f"Binance fetch failed for {symbol}: {e}")
+        logger.warning(f"CoinGecko fetch failed for {symbol}: {e}")
         return []
+
+
+async def fetch_current_price(symbol: str) -> float:
+    """Get current price from CoinGecko"""
+    coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": coin_id, "vs_currencies": "usd"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data[coin_id]["usd"])
+    except Exception as e:
+        logger.warning(f"Price fetch failed for {symbol}: {e}")
+        return 0.0
 
 
 async def bot_main_loop():
@@ -66,22 +92,19 @@ async def bot_main_loop():
     try:
         from database import get_db, User, Trade, TradeStatus
         from sqlalchemy import select
-        from signal_engine import SignalEngine, generate_signal
+        from signal_engine import generate_signal
 
-        # Get DB session
         async_gen = get_db()
         db = await async_gen.__anext__()
 
         try:
-            # Check for users with bot enabled
             result = await db.execute(
                 select(User).where(User.bot_enabled == True)
             )
             users = result.scalars().all()
 
             if not users:
-                logger.info("Bot loop: no active users, generating demo signals anyway")
-                # Still generate + store signals so Live Signals page works
+                logger.info("Bot loop: no active users, generating demo signals")
                 await generate_and_store_signals(None, db)
             else:
                 logger.info(f"Bot loop: processing {len(users)} active users")
@@ -106,23 +129,21 @@ async def generate_and_store_signals(user, db):
     for symbol in PAIRS:
         try:
             candles = await fetch_candles(symbol)
-            if len(candles) < 30:
+            if len(candles) < 10:
                 logger.warning(f"Not enough candles for {symbol}: {len(candles)}")
                 continue
 
-            # generate_signal is sync - call directly
             result = generate_signal(candles)
-
-            # Always store signal regardless of buy/sell/hold so UI has data
             current_price = candles[-1]["close"]
+
             trade = Trade(
                 user_id=user.id if user else "system",
                 exchange_name="paper_trading",
-                symbol=symbol.replace("USDT", "/USDT"),  # BTC/USDT format for display
+                symbol=symbol,
                 signal=result.signal,
                 confidence=result.confidence,
                 price=current_price,
-                quantity=round(10.0 / current_price, 6),  # $10 paper trade
+                quantity=round(10.0 / current_price, 8) if current_price > 0 else 0,
                 total_usdt=10.0,
                 rsi=result.rsi,
                 macd=result.macd,
@@ -135,7 +156,8 @@ async def generate_and_store_signals(user, db):
             logger.info(
                 f"Signal [{symbol}]: {result.signal.upper()} "
                 f"confidence={result.confidence}% "
-                f"RSI={result.rsi} | {result.reasoning[:60]}"
+                f"price=${current_price:,.2f} "
+                f"RSI={result.rsi}"
             )
 
         except Exception as e:
