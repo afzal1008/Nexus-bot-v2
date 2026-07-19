@@ -16,7 +16,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password
 DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
 DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    pool_timeout=30,
+    connect_args={"server_settings": {"application_name": "nexusbot"}}
+)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
