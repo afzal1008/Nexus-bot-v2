@@ -33,20 +33,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Nexus Bot API", version="2.0", lifespan=lifespan)
 
-# CORS - allow all origins
+# CORS middleware - must be first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-# Handle OPTIONS preflight requests explicitly
+# Add CORS headers to ALL responses including errors
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+# Handle OPTIONS preflight
 @app.options("/{rest_of_path:path}")
-async def preflight_handler(request: Request, rest_of_path: str):
+async def preflight(rest_of_path: str):
     return JSONResponse(
-        content={},
+        content={"status": "ok"},
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
@@ -84,6 +94,7 @@ async def bot_settings(
     current_user.bot_enabled = body.bot_enabled
     current_user.trade_amount_usdt = max(5.0, min(body.trade_amount_usdt, 10000.0))
     await db.commit()
+    logger.info(f"Bot {'ENABLED' if body.bot_enabled else 'DISABLED'} for {current_user.email}")
     return {
         "status": "success",
         "bot_enabled": current_user.bot_enabled,
