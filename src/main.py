@@ -3,7 +3,7 @@ Nexus Bot - Main FastAPI Application
 """
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
@@ -26,54 +26,60 @@ async def lifespan(app: FastAPI):
     scheduler = AsyncIOScheduler()
     scheduler_manager.start(scheduler)
     scheduler.start()
-    logger.info("Bot running every 30 seconds")
+    logger.info("Bot running every 60 seconds")
     yield
     scheduler.shutdown()
     logger.info("Bot stopped")
 
 app = FastAPI(title="Nexus Bot API", version="2.0", lifespan=lifespan)
 
-# CORS middleware - must be first
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+}
+
+# Handle ALL OPTIONS requests first
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return Response(status_code=200, headers=CORS_HEADERS)
+
+# Add CORS headers to every single response
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(status_code=200, headers=CORS_HEADERS)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": str(e)}
+        )
+    for key, value in CORS_HEADERS.items():
+        response.headers[key] = value
+    return response
+
+# Also add FastAPI CORS middleware as backup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
-
-# Add CORS headers to ALL responses including errors
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
-# Handle OPTIONS preflight
-@app.options("/{rest_of_path:path}")
-async def preflight(rest_of_path: str):
-    return JSONResponse(
-        content={"status": "ok"},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
 
 from routers import auth, dashboard, exchanges, payments, users, admin, signals, trades
 
-app.include_router(auth.router,       prefix="/api/auth",      tags=["auth"])
-app.include_router(dashboard.router,  prefix="/api/dashboard", tags=["dashboard"])
-app.include_router(exchanges.router,  prefix="/api/exchanges", tags=["exchanges"])
-app.include_router(payments.router,   prefix="/api/payments",  tags=["payments"])
-app.include_router(users.router,      prefix="/api/users",     tags=["users"])
-app.include_router(admin.router,      prefix="/api/admin",     tags=["admin"])
-app.include_router(signals.router,    prefix="/api/signals",   tags=["signals"])
-app.include_router(trades.router,     prefix="/api/trades",    tags=["trades"])
+app.include_router(auth.router,      prefix="/api/auth",      tags=["auth"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
+app.include_router(exchanges.router, prefix="/api/exchanges", tags=["exchanges"])
+app.include_router(payments.router,  prefix="/api/payments",  tags=["payments"])
+app.include_router(users.router,     prefix="/api/users",     tags=["users"])
+app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
+app.include_router(signals.router,   prefix="/api/signals",   tags=["signals"])
+app.include_router(trades.router,    prefix="/api/trades",    tags=["trades"])
 
 from pydantic import BaseModel
 from database import get_db, User, Trade, TradeStatus
@@ -94,7 +100,6 @@ async def bot_settings(
     current_user.bot_enabled = body.bot_enabled
     current_user.trade_amount_usdt = max(5.0, min(body.trade_amount_usdt, 10000.0))
     await db.commit()
-    logger.info(f"Bot {'ENABLED' if body.bot_enabled else 'DISABLED'} for {current_user.email}")
     return {
         "status": "success",
         "bot_enabled": current_user.bot_enabled,
@@ -130,7 +135,6 @@ async def bot_history(
             "entry_price": float(t.price or 0),
             "pnl_usdt": float(t.pnl_usdt or 0),
             "status": t.status.value if hasattr(t.status, 'value') else str(t.status),
-            "exchange": t.exchange_name,
             "quantity": float(t.quantity or 0),
             "created_at": t.created_at.isoformat() if t.created_at else None
         }
