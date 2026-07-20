@@ -221,9 +221,9 @@ async def process_user(user, db):
                             Trade.symbol == symbol,
                             Trade.status == TradeStatus.pending
                         )
-                    )
+                    ).limit(1)
                 )
-                if existing.scalar_one_or_none():
+                if existing.scalars().first():
                     logger.info(f"Open position exists for {symbol}")
                     continue
 
