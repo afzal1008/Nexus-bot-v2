@@ -1,9 +1,11 @@
 """
-Bot Engine - Runs every 30 seconds
-Uses CoinGecko API (works in UAE and all countries)
+Bot Engine - Uses multiple free APIs with fallback
+Primary: Kraken (no rate limits, works in UAE)
+Fallback: CoinGecko
 """
 import logging
 import httpx
+import asyncio
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -11,6 +13,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 PAIRS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+
+# Kraken uses different pair names
+KRAKEN_PAIRS = {
+    "BTC/USDT": "XBTUSD",
+    "ETH/USDT": "ETHUSD",
+    "BNB/USDT": "BNBUSD",
+    "SOL/USDT": "SOLUSD",
+    "XRP/USDT": "XRPUSD"
+}
 
 COINGECKO_IDS = {
     "BTC/USDT": "bitcoin",
@@ -28,32 +39,67 @@ class SchedulerManager:
     def start(self, scheduler: AsyncIOScheduler):
         self.scheduler = scheduler
         self.scheduler.add_job(
-            bot_main_loop,
-            "interval",
-            seconds=30,
-            id="nexus-bot-loop",
-            replace_existing=True
+            bot_main_loop, "interval", seconds=60,
+            id="nexus-bot-loop", replace_existing=True
         )
         self.scheduler.add_job(
-            auto_close_trades,
-            "interval",
-            minutes=5,
-            id="nexus-auto-close",
-            replace_existing=True
+            auto_close_trades, "interval", minutes=10,
+            id="nexus-auto-close", replace_existing=True
         )
-        logger.info("✅ Bot scheduler started - 30 second interval")
+        logger.info("✅ Bot scheduler started - 60 second interval")
 
 
 scheduler_manager = SchedulerManager()
 
 
-async def fetch_candles(symbol: str) -> list:
-    coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
+async def fetch_candles_kraken(symbol: str) -> list:
+    """Fetch from Kraken - free, no auth needed, works everywhere"""
+    kraken_pair = KRAKEN_PAIRS.get(symbol)
+    if not kraken_pair:
+        return []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": kraken_pair, "interval": 60}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("error"):
+                return []
+            result = data.get("result", {})
+            # Get first key that's not "last"
+            pair_key = [k for k in result.keys() if k != "last"]
+            if not pair_key:
+                return []
+            raw = result[pair_key[0]]
+            candles = [
+                {
+                    "timestamp": int(c[0]),
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[6])
+                }
+                for c in raw
+            ]
+            logger.info(f"✅ Kraken: {len(candles)} candles for {symbol}")
+            return candles
+    except Exception as e:
+        logger.warning(f"Kraken failed for {symbol}: {e}")
+        return []
+
+
+async def fetch_candles_coingecko(symbol: str) -> list:
+    """Fallback: CoinGecko"""
+    coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
+    try:
+        await asyncio.sleep(2)  # Rate limit delay
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
                 f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
-                params={"vs_currency": "usd", "days": "30"}
+                params={"vs_currency": "usd", "days": "7"}
             )
             resp.raise_for_status()
             raw = resp.json()
@@ -69,20 +115,34 @@ async def fetch_candles(symbol: str) -> list:
                 for c in raw
             ]
     except Exception as e:
-        logger.warning(f"CoinGecko fetch failed for {symbol}: {e}")
+        logger.warning(f"CoinGecko failed for {symbol}: {e}")
         return []
 
 
+async def fetch_candles(symbol: str) -> list:
+    """Try Kraken first, fallback to CoinGecko"""
+    candles = await fetch_candles_kraken(symbol)
+    if len(candles) >= 10:
+        return candles
+    logger.info(f"Falling back to CoinGecko for {symbol}")
+    return await fetch_candles_coingecko(symbol)
+
+
 async def fetch_current_price(symbol: str) -> float:
-    coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
+    """Get price from Kraken"""
+    kraken_pair = KRAKEN_PAIRS.get(symbol)
+    if not kraken_pair:
+        return 0.0
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": coin_id, "vs_currencies": "usd"}
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": kraken_pair}
             )
-            resp.raise_for_status()
-            return float(resp.json()[coin_id]["usd"])
+            data = resp.json()
+            result = data.get("result", {})
+            pair_key = [k for k in result.keys()][0]
+            return float(result[pair_key]["c"][0])
     except Exception as e:
         logger.warning(f"Price fetch failed for {symbol}: {e}")
         return 0.0
@@ -90,9 +150,8 @@ async def fetch_current_price(symbol: str) -> float:
 
 async def bot_main_loop():
     try:
-        from database import get_db, User, Trade, TradeStatus
+        from database import get_db, User
         from sqlalchemy import select
-        from signal_engine import generate_signal
 
         async_gen = get_db()
         db = await async_gen.__anext__()
@@ -104,9 +163,10 @@ async def bot_main_loop():
             users = result.scalars().all()
 
             if not users:
-                logger.info("No active users with bot enabled")
+                logger.info("No active users")
                 return
 
+            logger.info(f"Processing {len(users)} users")
             for user in users:
                 await process_user(user, db)
 
@@ -127,25 +187,33 @@ async def process_user(user, db):
 
     for symbol in PAIRS:
         try:
+            # Add delay between pairs to avoid rate limits
+            await asyncio.sleep(1)
+
             candles = await fetch_candles(symbol)
             if len(candles) < 10:
-                logger.warning(f"Not enough candles for {symbol}")
+                logger.warning(f"Not enough candles for {symbol}: {len(candles)}")
                 continue
 
             result = generate_signal(candles)
             current_price = candles[-1]["close"]
-            signal_str = result.signal.lower() if isinstance(result.signal, str) else result.signal.value.lower()
+
+            # Get signal as string
+            if isinstance(result.signal, str):
+                signal_str = result.signal.lower()
+            else:
+                signal_str = result.signal.value.lower()
 
             logger.info(
-                f"Signal [{symbol}]: {signal_str.upper()} "
-                f"confidence={result.confidence}% "
-                f"price=${current_price:,.2f} RSI={result.rsi}"
+                f"[{symbol}] {signal_str.upper()} "
+                f"conf={result.confidence}% "
+                f"price=${current_price:,.2f} "
+                f"RSI={result.rsi}"
             )
 
-            # Only execute on buy/sell with enough confidence
+            # Execute if buy or sell with confidence >= 25%
             if signal_str in ["buy", "sell"] and result.confidence >= 25:
-
-                # Check no open position for this pair
+                # Check no existing pending trade for this pair
                 existing = await db.execute(
                     select(Trade).where(
                         and_(
@@ -156,7 +224,7 @@ async def process_user(user, db):
                     )
                 )
                 if existing.scalar_one_or_none():
-                    logger.info(f"Position already open for {symbol} - skipping")
+                    logger.info(f"Open position exists for {symbol}")
                     continue
 
                 trade_amount = float(user.trade_amount_usdt or 10.0)
@@ -174,22 +242,23 @@ async def process_user(user, db):
                     rsi=result.rsi,
                     macd=result.macd,
                     bb_position=result.bb_position,
-                    status=TradeStatus.executed,
+                    status=TradeStatus.pending,
                     executed_at=datetime.utcnow(),
                     created_at=datetime.utcnow()
                 )
                 db.add(trade)
                 logger.info(
-                    f"✅ EXECUTED {signal_str.upper()} {symbol} "
-                    f"@ ${current_price:,.2f} qty={qty}"
+                    f"✅ OPENED {signal_str.upper()} "
+                    f"{symbol} @ ${current_price:,.2f} "
+                    f"qty={qty}"
                 )
 
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+            logger.error(f"Error for {symbol}: {e}", exc_info=True)
 
 
 async def auto_close_trades():
-    """Auto-close trades after 4 hours"""
+    """Auto-close trades after 4 hours and calculate P&L"""
     try:
         from database import get_db, Trade, TradeStatus
         from sqlalchemy import select, and_
@@ -202,13 +271,18 @@ async def auto_close_trades():
             result = await db.execute(
                 select(Trade).where(
                     and_(
-                        Trade.status == TradeStatus.executed,
-                        Trade.executed_at <= cutoff,
-                        Trade.pnl_usdt == None
+                        Trade.status == TradeStatus.pending,
+                        Trade.created_at <= cutoff
                     )
                 )
             )
             trades = result.scalars().all()
+
+            if not trades:
+                logger.info("No trades to close")
+                return
+
+            logger.info(f"Auto-closing {len(trades)} trades")
 
             for trade in trades:
                 current_price = await fetch_current_price(trade.symbol)
@@ -219,20 +293,16 @@ async def auto_close_trades():
                 qty = float(trade.quantity or 0)
                 signal_str = trade.signal.lower() if isinstance(trade.signal, str) else trade.signal.value.lower()
 
-                if signal_str == "buy":
-                    pnl = (current_price - entry) * qty
-                else:
-                    pnl = (entry - current_price) * qty
-
+                pnl = (current_price - entry) * qty if signal_str == "buy" else (entry - current_price) * qty
                 trade.pnl_usdt = round(pnl, 4)
-                logger.info(
-                    f"Auto-closed {trade.symbol}: "
-                    f"{'🟢' if pnl >= 0 else '🔴'} ${pnl:+.4f} USDT"
-                )
+                trade.status = TradeStatus.executed
+                trade.executed_at = datetime.utcnow()
 
-            if trades:
-                await db.commit()
-                logger.info(f"✅ Auto-closed {len(trades)} trades")
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                logger.info(f"{emoji} Closed {trade.symbol}: ${pnl:+.4f} USDT")
+
+            await db.commit()
+            logger.info(f"✅ Closed {len(trades)} trades")
 
         finally:
             await db.close()
