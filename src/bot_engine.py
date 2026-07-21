@@ -148,6 +148,36 @@ async def fetch_current_price(symbol: str) -> float:
         return 0.0
 
 
+async def fetch_top_gainers() -> list:
+    """Get top 5 gaining coins from CoinGecko to add to monitoring"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "price_change_percentage_24h_desc",
+                    "per_page": 10,
+                    "page": 1,
+                    "price_change_percentage": "24h"
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            gainers = []
+            for coin in data:
+                symbol = coin["symbol"].upper() + "/USDT"
+                if symbol not in BASE_PAIRS and coin.get("price_change_percentage_24h", 0) > 5:
+                    gainers.append(symbol)
+                    COINGECKO_IDS[symbol] = coin["id"]
+                    if len(gainers) >= 3:
+                        break
+            return gainers
+    except Exception as e:
+        logger.warning(f"Top gainers fetch failed: {e}")
+        return []
+
+
 async def bot_main_loop():
     try:
         from database import get_db, User
@@ -166,7 +196,14 @@ async def bot_main_loop():
                 logger.info("No active users")
                 return
 
-            logger.info(f"Processing {len(users)} users")
+            # Update pairs with top gainers
+            global PAIRS
+            top_gainers = await fetch_top_gainers()
+            PAIRS = BASE_PAIRS + top_gainers
+            if top_gainers:
+                logger.info(f"Adding top gainers to monitoring: {top_gainers}")
+
+            logger.info(f"Processing {len(users)} users — monitoring {len(PAIRS)} pairs")
             for user in users:
                 await process_user(user, db)
 
