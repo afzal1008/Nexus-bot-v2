@@ -18,7 +18,7 @@ async def dashboard_summary(
     db: AsyncSession = Depends(get_db)
 ):
     """Dashboard summary stats"""
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    thirty_days_ago = datetime.utcnow() - timedelta(hours=24)
 
     # Total signals in last 30 days
     result = await db.execute(
