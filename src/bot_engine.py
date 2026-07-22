@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 PAIRS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
-
+BASE_PAIRS = list(PAIRS)
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
     "BTC/USDT": "XBTUSD",
