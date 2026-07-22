@@ -122,7 +122,7 @@ async def close_trade(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Close/exit an open position — calculates P&L"""
+    """Close/exit an open position — calculates P&L and stores the exit price"""
     result = await db.execute(
         select(Trade)
         .where(Trade.id == trade_id)
@@ -142,6 +142,7 @@ async def close_trade(
     else:
         pnl = (entry_price - current_price) * quantity
 
+    trade.exit_price = current_price
     trade.status = TradeStatus.executed
     trade.pnl_usdt = round(pnl, 4)
     trade.executed_at = datetime.utcnow()
