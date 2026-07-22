@@ -4,7 +4,7 @@ Database - PostgreSQL with SQLAlchemy async
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
-from sqlalchemy import String, Boolean, DateTime, Float, Text, ForeignKey, Enum as SAEnum
+from sqlalchemy import String, Boolean, DateTime, Float, Text, ForeignKey, Enum as SAEnum, text
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 from typing import Optional, List
@@ -13,17 +13,10 @@ import enum
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost/nexusbot")
+# Render provides postgres:// — convert to postgresql+asyncpg://
 DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
-DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=300,
-    pool_timeout=30,
-    connect_args={"server_settings": {"application_name": "nexusbot"}}
-)
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
@@ -117,7 +110,8 @@ class Trade(Base):
     order_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     order_type: Mapped[str] = mapped_column(String, default="market")
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
-    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)          # entry / buy price
+    exit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)     # exit / sell price, set on close
     total_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # Signal details
@@ -160,6 +154,16 @@ class Payment(Base):
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await run_migrations()
+
+
+async def run_migrations():
+    """Lightweight, safe migrations for columns added after initial deploy.
+    Uses IF NOT EXISTS so it's harmless to run on every startup."""
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION"
+        ))
 
 async def get_db():
     async with AsyncSessionLocal() as session:
