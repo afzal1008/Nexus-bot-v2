@@ -129,13 +129,17 @@ async def bot_history(
     return [
         {
             "id": t.id,
+            "exchange": t.exchange_name,
             "symbol": t.symbol,
             "signal": t.signal.value if hasattr(t.signal, 'value') else str(t.signal),
             "confidence": float(t.confidence or 0),
-            "entry_price": float(t.price or 0),
-            "pnl_usdt": float(t.pnl_usdt or 0),
-            "status": t.status.value if hasattr(t.status, 'value') else str(t.status),
+            "price": float(t.price or 0),              # buy/entry price
+            "entry_price": float(t.price or 0),         # kept for backward compatibility
+            "exit_price": float(t.exit_price) if t.exit_price is not None else None,  # sell price, once closed
             "quantity": float(t.quantity or 0),
+            "total_usdt": float(t.total_usdt or 0),
+            "pnl_usdt": float(t.pnl_usdt) if t.pnl_usdt is not None else None,
+            "status": t.status.value if hasattr(t.status, 'value') else str(t.status),
             "created_at": t.created_at.isoformat() if t.created_at else None
         }
         for t in trades
