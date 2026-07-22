@@ -89,7 +89,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 class BotSettingsRequest(BaseModel):
     bot_enabled: bool
-    trade_amount_usdt: float = 10.0
+    trade_amount_usdt: float = 500.0
 
 @app.post("/api/bot/settings")
 async def bot_settings(
@@ -98,7 +98,7 @@ async def bot_settings(
     db: AsyncSession = Depends(get_db)
 ):
     current_user.bot_enabled = body.bot_enabled
-    current_user.trade_amount_usdt = max(5.0, min(body.trade_amount_usdt, 10000.0))
+    current_user.trade_amount_usdt = max(500.0, min(body.trade_amount_usdt, 10000.0))
     await db.commit()
     return {
         "status": "success",
