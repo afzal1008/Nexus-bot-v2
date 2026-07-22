@@ -20,6 +20,7 @@ elif DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -70,7 +71,8 @@ class User(Base):
 
     # Bot settings
     bot_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    trade_amount_usdt: Mapped[float] = mapped_column(Float, default=10.0)  # per trade
+    trade_amount_usdt: Mapped[float] = mapped_column(Float, default=500.0)   # per trade, paper money (min $500)
+    paper_balance_usdt: Mapped[float] = mapped_column(Float, default=10000.0)  # total virtual wallet
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -167,6 +169,13 @@ async def run_migrations():
     async with engine.begin() as conn:
         await conn.execute(text(
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS paper_balance_usdt DOUBLE PRECISION DEFAULT 10000"
+        ))
+        # Existing users created before this change get the new default backfilled once
+        await conn.execute(text(
+            "UPDATE users SET paper_balance_usdt = 10000 WHERE paper_balance_usdt IS NULL"
         ))
 
 async def get_db():
