@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
-from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS
+from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT
 from pydantic import BaseModel
 from datetime import datetime
 import httpx
@@ -21,7 +21,7 @@ router = APIRouter()
 class ManualTradeRequest(BaseModel):
     symbol: str          # e.g. "BTC/USDT"
     action: str          # "buy" or "sell"
-    amount_usdt: float   # how much USDT to use
+    amount_usdt: float   # how much paper USDT to use
 
 
 async def get_current_price(symbol: str) -> float:
@@ -44,7 +44,6 @@ async def get_current_price(symbol: str) -> float:
         except Exception as e:
             logger.warning(f"Kraken price fetch failed for {symbol}: {e}")
 
-    # Fallback: CoinGecko simple price (works for base pairs + top gainers alike)
     coin_id = COINGECKO_IDS.get(symbol)
     if coin_id:
         try:
@@ -70,35 +69,42 @@ async def manual_trade(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Execute a manual paper trade (buy or sell)"""
+    """Execute a manual paper trade (buy or sell) — draws from the user's paper wallet"""
 
-    # Validate
     action = body.action.lower()
     if action not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="action must be 'buy' or 'sell'")
 
-    if body.amount_usdt < 1:
-        raise HTTPException(status_code=400, detail="Minimum trade amount is $1 USDT")
+    if body.amount_usdt < MIN_TRADE_USDT:
+        raise HTTPException(status_code=400, detail=f"Minimum trade amount is ${MIN_TRADE_USDT:.0f} USDT")
 
-    # Get live price
+    current_balance = float(current_user.paper_balance_usdt or 0)
+    if current_balance < body.amount_usdt:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient paper balance: ${current_balance:.2f} available, ${body.amount_usdt:.2f} requested"
+        )
+
     price = await get_current_price(body.symbol)
     quantity = round(body.amount_usdt / price, 8)
 
-    # Save trade record
     trade = Trade(
         user_id=current_user.id,
         exchange_name="paper_trading",
         symbol=body.symbol,
         signal=TradeSignal.buy if action == "buy" else TradeSignal.sell,
-        confidence=100.0,       # manual = 100% confidence
+        confidence=100.0,
         price=price,
         quantity=quantity,
         total_usdt=body.amount_usdt,
-        status=TradeStatus.executed,   # paper trade = instantly executed
-        executed_at=datetime.utcnow(),
+        status=TradeStatus.pending,   # left open so P&L can be tracked and it settles like bot trades
         created_at=datetime.utcnow()
     )
     db.add(trade)
+
+    # Reserve the allocated paper money while the position is open
+    current_user.paper_balance_usdt = current_balance - body.amount_usdt
+
     await db.commit()
 
     logger.info(f"Manual {action.upper()} by {current_user.email}: {body.symbol} qty={quantity} @ ${price}")
@@ -110,7 +116,8 @@ async def manual_trade(
         "price": price,
         "quantity": quantity,
         "total_usdt": body.amount_usdt,
-        "message": f"✅ Paper {action.upper()} executed: {quantity:.6f} {body.symbol.split('/')[0]} @ ${price:,.2f}"
+        "paper_balance_usdt": current_user.paper_balance_usdt,
+        "message": f"✅ Paper {action.upper()} opened: {quantity:.6f} {body.symbol.split('/')[0]} @ ${price:,.2f}"
     }
 
 
@@ -149,7 +156,7 @@ async def close_trade(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Close/exit an open position — calculates P&L and stores the exit price"""
+    """Close/exit an open position — calculates P&L, stores exit price, settles the wallet"""
     result = await db.execute(
         select(Trade)
         .where(Trade.id == trade_id)
@@ -159,7 +166,6 @@ async def close_trade(
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    # Get current price to calculate P&L
     current_price = await get_current_price(trade.symbol)
     entry_price = float(trade.price or 0)
     quantity = float(trade.quantity or 0)
@@ -173,6 +179,11 @@ async def close_trade(
     trade.status = TradeStatus.executed
     trade.pnl_usdt = round(pnl, 4)
     trade.executed_at = datetime.utcnow()
+
+    # Return the reserved principal + P&L back to the user's paper wallet
+    principal = float(trade.total_usdt or 0)
+    current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
+
     await db.commit()
 
     return {
@@ -182,5 +193,6 @@ async def close_trade(
         "exit_price": current_price,
         "quantity": quantity,
         "pnl_usdt": round(pnl, 4),
+        "paper_balance_usdt": current_user.paper_balance_usdt,
         "message": f"{'🟢 Profit' if pnl >= 0 else '🔴 Loss'}: ${pnl:+.4f} USDT"
     }
