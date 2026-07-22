@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 PAIRS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
 BASE_PAIRS = list(PAIRS)
+
+GAINER_THRESHOLD_PCT = 2.5   # lower bar so more coins qualify
+MAX_GAINERS = 5              # allow more extra coins per loop
+
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
     "BTC/USDT": "XBTUSD",
@@ -149,7 +153,7 @@ async def fetch_current_price(symbol: str) -> float:
 
 
 async def fetch_top_gainers() -> list:
-    """Get top 5 gaining coins from CoinGecko to add to monitoring"""
+    """Get top gaining coins from CoinGecko to add to monitoring"""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -157,7 +161,7 @@ async def fetch_top_gainers() -> list:
                 params={
                     "vs_currency": "usd",
                     "order": "price_change_percentage_24h_desc",
-                    "per_page": 10,
+                    "per_page": 20,
                     "page": 1,
                     "price_change_percentage": "24h"
                 }
@@ -167,11 +171,13 @@ async def fetch_top_gainers() -> list:
             gainers = []
             for coin in data:
                 symbol = coin["symbol"].upper() + "/USDT"
-                if symbol not in BASE_PAIRS and coin.get("price_change_percentage_24h", 0) > 5:
+                if symbol not in BASE_PAIRS and coin.get("price_change_percentage_24h", 0) > GAINER_THRESHOLD_PCT:
                     gainers.append(symbol)
                     COINGECKO_IDS[symbol] = coin["id"]
-                    if len(gainers) >= 3:
+                    if len(gainers) >= MAX_GAINERS:
                         break
+            if not gainers:
+                logger.info(f"No coins currently exceed +{GAINER_THRESHOLD_PCT}% (24h) — using base pairs only")
             return gainers
     except Exception as e:
         logger.warning(f"Top gainers fetch failed: {e}")
@@ -202,6 +208,8 @@ async def bot_main_loop():
             PAIRS = BASE_PAIRS + top_gainers
             if top_gainers:
                 logger.info(f"Adding top gainers to monitoring: {top_gainers}")
+            else:
+                logger.info("No qualifying gainers this cycle — monitoring base pairs only")
 
             logger.info(f"Processing {len(users)} users — monitoring {len(PAIRS)} pairs")
             for user in users:
