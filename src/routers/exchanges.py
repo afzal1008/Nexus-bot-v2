@@ -10,21 +10,29 @@ from routers.auth import get_current_user
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from cryptography.fernet import Fernet
 import base64
+import hashlib
 import os
 
 router = APIRouter()
 
 ENCRYPT_KEY = os.getenv("ENCRYPT_KEY", "nexus-encrypt-key-2024")
+def _get_fernet() -> Fernet:
+    """Derive a valid Fernet key from ENCRYPT_KEY env var (any string works)."""
+    digest = hashlib.sha256(ENCRYPT_KEY.encode()).digest()
+    key = base64.urlsafe_b64encode(digest)
+    return Fernet(key)
 
 
+_fernet = _get_fernet()
 def simple_encrypt(text: str) -> str:
-    """Simple base64 encoding — replace with Fernet in production"""
-    return base64.b64encode(text.encode()).decode()
+    """Real AES-based encryption via Fernet."""
+    return _fernet.encrypt(text.encode()).decode()
 
 
 def simple_decrypt(text: str) -> str:
-    return base64.b64decode(text.encode()).decode()
+    return _fernet.decrypt(text.encode()).decode()
 
 
 class ExchangeRequest(BaseModel):
