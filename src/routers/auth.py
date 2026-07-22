@@ -74,7 +74,8 @@ def user_to_dict(user: User, token: str = None):
         "full_name": user.full_name,
         "plan": user.plan.value if hasattr(user.plan, 'value') else str(user.plan),
         "bot_enabled": user.bot_enabled,
-        "trade_amount_usdt": float(user.trade_amount_usdt or 10.0),
+        "trade_amount_usdt": float(user.trade_amount_usdt or 500.0),
+        "paper_balance_usdt": float(user.paper_balance_usdt if user.paper_balance_usdt is not None else 10000.0),
         "is_active": user.is_active,
     }
     if token:
@@ -99,7 +100,8 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
             is_active=True,
             is_verified=True,
             bot_enabled=False,
-            trade_amount_usdt=10.0,
+            trade_amount_usdt=500.0,       # $500 paper money per trade (minimum)
+            paper_balance_usdt=10000.0,    # $10,000 starting paper wallet
         )
         db.add(user)
         await db.commit()
