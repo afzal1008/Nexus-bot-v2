@@ -349,6 +349,7 @@ async def auto_close_trades():
                 signal_str = trade.signal.lower() if isinstance(trade.signal, str) else trade.signal.value.lower()
 
                 pnl = (current_price - entry) * qty if signal_str == "buy" else (entry - current_price) * qty
+                trade.exit_price = current_price
                 trade.pnl_usdt = round(pnl, 4)
                 trade.status = TradeStatus.executed
                 trade.executed_at = datetime.utcnow()
