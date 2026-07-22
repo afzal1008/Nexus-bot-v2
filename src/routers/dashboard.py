@@ -113,5 +113,6 @@ async def dashboard_summary(
         "paper_balance": paper_balance,
         "bot_enabled": current_user.bot_enabled,
         "plan": current_user.plan.value if hasattr(current_user.plan, 'value') else str(current_user.plan),
+        "paper_balance_usdt": float(current_user.paper_balance_usdt if current_user.paper_balance_usdt is not None else 10000.0),
         "recent_signals": recent_signals,
     }
