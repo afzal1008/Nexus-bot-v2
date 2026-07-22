@@ -35,6 +35,10 @@ COINGECKO_IDS = {
     "XRP/USDT": "ripple"
 }
 
+# Cache for top-gainers lookup (avoids hammering CoinGecko every 60s)
+_gainers_cache = {"data": [], "fetched_at": None}
+GAINERS_CACHE_SECONDS = 300   # only refetch every 5 minutes
+
 
 class SchedulerManager:
     def __init__(self):
@@ -153,7 +157,11 @@ async def fetch_current_price(symbol: str) -> float:
 
 
 async def fetch_top_gainers() -> list:
-    """Get top gaining coins from CoinGecko to add to monitoring"""
+    """Get top gaining coins from CoinGecko to add to monitoring — cached to avoid rate limits"""
+    now = datetime.utcnow()
+    if _gainers_cache["fetched_at"] and (now - _gainers_cache["fetched_at"]).total_seconds() < GAINERS_CACHE_SECONDS:
+        return _gainers_cache["data"]
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -178,10 +186,12 @@ async def fetch_top_gainers() -> list:
                         break
             if not gainers:
                 logger.info(f"No coins currently exceed +{GAINER_THRESHOLD_PCT}% (24h) — using base pairs only")
+            _gainers_cache["data"] = gainers
+            _gainers_cache["fetched_at"] = now
             return gainers
     except Exception as e:
         logger.warning(f"Top gainers fetch failed: {e}")
-        return []
+        return _gainers_cache["data"]   # reuse last known good list instead of going empty
 
 
 async def bot_main_loop():
