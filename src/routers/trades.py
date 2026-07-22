@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
+from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS
 from pydantic import BaseModel
 from datetime import datetime
 import httpx
@@ -24,17 +25,43 @@ class ManualTradeRequest(BaseModel):
 
 
 async def get_current_price(symbol: str) -> float:
-    """Fetch live price from Binance public API"""
-    binance_symbol = symbol.replace("/", "")  # BTC/USDT -> BTCUSDT
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                f"https://api.binance.com/api/v3/ticker/price?symbol={binance_symbol}"
-            )
-            resp.raise_for_status()
-            return float(resp.json()["price"])
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Could not fetch price for {symbol}: {e}")
+    """Fetch live price - Kraken primary, CoinGecko fallback.
+    (Binance blocks many hosting regions with HTTP 451, so we don't use it here.)"""
+    kraken_pair = KRAKEN_PAIRS.get(symbol)
+    if kraken_pair:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://api.kraken.com/0/public/Ticker",
+                    params={"pair": kraken_pair}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("result", {})
+                if result and not data.get("error"):
+                    pair_key = list(result.keys())[0]
+                    return float(result[pair_key]["c"][0])
+        except Exception as e:
+            logger.warning(f"Kraken price fetch failed for {symbol}: {e}")
+
+    # Fallback: CoinGecko simple price (works for base pairs + top gainers alike)
+    coin_id = COINGECKO_IDS.get(symbol)
+    if coin_id:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": coin_id, "vs_currencies": "usd"}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                price = data.get(coin_id, {}).get("usd")
+                if price:
+                    return float(price)
+        except Exception as e:
+            logger.warning(f"CoinGecko price fetch failed for {symbol}: {e}")
+
+    raise HTTPException(status_code=503, detail=f"Could not fetch price for {symbol} from any source")
 
 
 @router.post("/manual")
