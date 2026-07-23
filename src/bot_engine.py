@@ -2,6 +2,11 @@
 Bot Engine - Uses multiple free APIs with fallback
 Primary: Kraken (no rate limits, works in UAE)
 Fallback: CoinGecko
+
+SPOT-ONLY TRADING MODE:
+- BUY opens a new paper position (only if one isn't already open for that symbol)
+- SELL only closes an existing open position and realizes its P&L
+- There is no shorting — a SELL signal with nothing open is simply ignored
 """
 import logging
 import httpx
@@ -18,8 +23,9 @@ BASE_PAIRS = list(PAIRS)
 GAINER_THRESHOLD_PCT = 2.5   # lower bar so more coins qualify
 MAX_GAINERS = 5              # allow more extra coins per loop
 
-MIN_TRADE_USDT = 500.0        # minimum paper allocation per trade
-STARTING_BALANCE_USDT = 10000.0  # starting/reference paper wallet size
+MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
+STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
+MIN_CONFIDENCE_PCT = 25           # minimum signal confidence to act on
 
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
@@ -214,7 +220,6 @@ async def bot_main_loop():
                 logger.info("No active users")
                 return
 
-            # Update pairs with top gainers
             global PAIRS
             top_gainers = await fetch_top_gainers()
             PAIRS = BASE_PAIRS + top_gainers
@@ -238,14 +243,14 @@ async def bot_main_loop():
 
 
 async def process_user(user, db):
+    """Spot-only logic: BUY opens a position, SELL only closes an existing one. No shorting."""
     from signal_engine import generate_signal
     from database import Trade, TradeStatus
     from sqlalchemy import select, and_
 
     for symbol in PAIRS:
         try:
-            # Add delay between pairs to avoid rate limits
-            await asyncio.sleep(1)
+            await asyncio.sleep(1)  # avoid hammering rate limits between pairs
 
             candles = await fetch_candles(symbol)
             if len(candles) < 10:
@@ -267,24 +272,29 @@ async def process_user(user, db):
                 f"RSI={result.rsi}"
             )
 
-            if signal_str in ["buy", "sell"] and result.confidence >= 25:
-                existing = await db.execute(
-                    select(Trade).where(
-                        and_(
-                            Trade.user_id == user.id,
-                            Trade.symbol == symbol,
-                            Trade.status == TradeStatus.pending
-                        )
-                    ).limit(1)
-                )
-                if existing.scalars().first():
-                    logger.info(f"Open position exists for {symbol}")
+            if signal_str == "hold" or result.confidence < MIN_CONFIDENCE_PCT:
+                continue
+
+            # Look up any existing open (pending) position for this user + symbol
+            existing = await db.execute(
+                select(Trade).where(
+                    and_(
+                        Trade.user_id == user.id,
+                        Trade.symbol == symbol,
+                        Trade.status == TradeStatus.pending
+                    )
+                ).limit(1)
+            )
+            open_trade = existing.scalars().first()
+
+            if signal_str == "buy":
+                if open_trade:
+                    logger.info(f"Already holding {symbol} — skipping new buy signal")
                     continue
 
                 trade_amount = max(MIN_TRADE_USDT, float(user.trade_amount_usdt or MIN_TRADE_USDT))
                 current_balance = float(user.paper_balance_usdt if user.paper_balance_usdt is not None else STARTING_BALANCE_USDT)
 
-                # Skip if not enough paper balance available to open this trade
                 if current_balance < trade_amount:
                     logger.info(
                         f"Skipping {symbol} for {user.email} — insufficient paper balance "
@@ -298,7 +308,7 @@ async def process_user(user, db):
                     user_id=user.id,
                     exchange_name="paper_trading",
                     symbol=symbol,
-                    signal=signal_str,
+                    signal="buy",
                     confidence=result.confidence,
                     price=current_price,
                     quantity=qty,
@@ -307,19 +317,38 @@ async def process_user(user, db):
                     macd=result.macd,
                     bb_position=result.bb_position,
                     status=TradeStatus.pending,
-                    executed_at=datetime.utcnow(),
                     created_at=datetime.utcnow()
                 )
                 db.add(trade)
-
-                # Reserve the allocated paper money while the position is open
                 user.paper_balance_usdt = current_balance - trade_amount
 
                 logger.info(
-                    f"✅ OPENED {signal_str.upper()} "
-                    f"{symbol} @ ${current_price:,.2f} "
+                    f"✅ BOUGHT {symbol} @ ${current_price:,.2f} "
                     f"qty={qty} amount=${trade_amount:.2f} "
                     f"(balance now ${user.paper_balance_usdt:.2f})"
+                )
+
+            elif signal_str == "sell":
+                if not open_trade:
+                    logger.info(f"Sell signal for {symbol} ignored — no open position to close (spot-only, no shorting)")
+                    continue
+
+                entry = float(open_trade.price or 0)
+                qty = float(open_trade.quantity or 0)
+                pnl = (current_price - entry) * qty
+
+                open_trade.exit_price = current_price
+                open_trade.pnl_usdt = round(pnl, 4)
+                open_trade.status = TradeStatus.executed
+                open_trade.executed_at = datetime.utcnow()
+
+                principal = float(open_trade.total_usdt or 0)
+                user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
+
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                logger.info(
+                    f"{emoji} SOLD {symbol} @ ${current_price:,.2f} — closed position, "
+                    f"P&L=${pnl:+.4f} (balance now ${user.paper_balance_usdt:.2f})"
                 )
 
         except Exception as e:
@@ -327,7 +356,7 @@ async def process_user(user, db):
 
 
 async def auto_close_trades():
-    """Auto-close trades after 4 hours, calculate P&L, and settle the paper wallet"""
+    """Safety net: force-close any position still open after 4 hours, settle wallet."""
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select, and_
@@ -351,7 +380,7 @@ async def auto_close_trades():
                 logger.info("No trades to close")
                 return
 
-            logger.info(f"Auto-closing {len(trades)} trades")
+            logger.info(f"Auto-closing {len(trades)} trades (held over 4 hours)")
 
             for trade in trades:
                 current_price = await fetch_current_price(trade.symbol)
@@ -360,15 +389,14 @@ async def auto_close_trades():
 
                 entry = float(trade.price or 0)
                 qty = float(trade.quantity or 0)
-                signal_str = trade.signal.lower() if isinstance(trade.signal, str) else trade.signal.value.lower()
+                # Spot-only: every open position is a buy/long, so P&L is always (exit - entry) * qty
+                pnl = (current_price - entry) * qty
 
-                pnl = (current_price - entry) * qty if signal_str == "buy" else (entry - current_price) * qty
                 trade.exit_price = current_price
                 trade.pnl_usdt = round(pnl, 4)
                 trade.status = TradeStatus.executed
                 trade.executed_at = datetime.utcnow()
 
-                # Return the reserved principal + P&L back to the user's paper wallet
                 user_result = await db.execute(select(User).where(User.id == trade.user_id))
                 user = user_result.scalar_one_or_none()
                 if user:
@@ -376,7 +404,7 @@ async def auto_close_trades():
                     user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
-                logger.info(f"{emoji} Closed {trade.symbol}: ${pnl:+.4f} USDT")
+                logger.info(f"{emoji} Auto-closed {trade.symbol}: ${pnl:+.4f} USDT")
 
             await db.commit()
             logger.info(f"✅ Closed {len(trades)} trades")
