@@ -1,11 +1,12 @@
 """
 Manual Trade Router
 File: routers/trades.py
-Handles manual buy/sell execution in paper trading mode
+Handles manual buy/sell in paper trading mode — SPOT ONLY, no shorting.
+"Buy" opens a new position. "Sell" only closes an existing open position for that symbol.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, and_
 from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
 from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT
@@ -21,7 +22,7 @@ router = APIRouter()
 class ManualTradeRequest(BaseModel):
     symbol: str          # e.g. "BTC/USDT"
     action: str          # "buy" or "sell"
-    amount_usdt: float   # how much paper USDT to use
+    amount_usdt: float   # how much paper USDT to use (ignored for "sell" — uses the open position's size)
 
 
 async def get_current_price(symbol: str) -> float:
@@ -69,56 +70,105 @@ async def manual_trade(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Execute a manual paper trade (buy or sell) — draws from the user's paper wallet"""
+    """Spot-only manual trade: 'buy' opens a position, 'sell' closes an existing one."""
 
     action = body.action.lower()
     if action not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="action must be 'buy' or 'sell'")
 
-    if body.amount_usdt < MIN_TRADE_USDT:
-        raise HTTPException(status_code=400, detail=f"Minimum trade amount is ${MIN_TRADE_USDT:.0f} USDT")
-
-    current_balance = float(current_user.paper_balance_usdt or 0)
-    if current_balance < body.amount_usdt:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient paper balance: ${current_balance:.2f} available, ${body.amount_usdt:.2f} requested"
-        )
-
-    price = await get_current_price(body.symbol)
-    quantity = round(body.amount_usdt / price, 8)
-
-    trade = Trade(
-        user_id=current_user.id,
-        exchange_name="paper_trading",
-        symbol=body.symbol,
-        signal=TradeSignal.buy if action == "buy" else TradeSignal.sell,
-        confidence=100.0,
-        price=price,
-        quantity=quantity,
-        total_usdt=body.amount_usdt,
-        status=TradeStatus.pending,   # left open so P&L can be tracked and it settles like bot trades
-        created_at=datetime.utcnow()
+    # Find any existing open position for this symbol
+    existing = await db.execute(
+        select(Trade).where(
+            and_(
+                Trade.user_id == current_user.id,
+                Trade.symbol == body.symbol,
+                Trade.status == TradeStatus.pending
+            )
+        ).limit(1)
     )
-    db.add(trade)
+    open_trade = existing.scalars().first()
 
-    # Reserve the allocated paper money while the position is open
-    current_user.paper_balance_usdt = current_balance - body.amount_usdt
+    if action == "buy":
+        if open_trade:
+            raise HTTPException(
+                status_code=400,
+                detail=f"You already have an open position in {body.symbol}. Sell it before buying again."
+            )
 
-    await db.commit()
+        if body.amount_usdt < MIN_TRADE_USDT:
+            raise HTTPException(status_code=400, detail=f"Minimum trade amount is ${MIN_TRADE_USDT:.0f} USDT")
 
-    logger.info(f"Manual {action.upper()} by {current_user.email}: {body.symbol} qty={quantity} @ ${price}")
+        current_balance = float(current_user.paper_balance_usdt or 0)
+        if current_balance < body.amount_usdt:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient paper balance: ${current_balance:.2f} available, ${body.amount_usdt:.2f} requested"
+            )
 
-    return {
-        "status": "executed",
-        "action": action,
-        "symbol": body.symbol,
-        "price": price,
-        "quantity": quantity,
-        "total_usdt": body.amount_usdt,
-        "paper_balance_usdt": current_user.paper_balance_usdt,
-        "message": f"✅ Paper {action.upper()} opened: {quantity:.6f} {body.symbol.split('/')[0]} @ ${price:,.2f}"
-    }
+        price = await get_current_price(body.symbol)
+        quantity = round(body.amount_usdt / price, 8)
+
+        trade = Trade(
+            user_id=current_user.id,
+            exchange_name="paper_trading",
+            symbol=body.symbol,
+            signal=TradeSignal.buy,
+            confidence=100.0,
+            price=price,
+            quantity=quantity,
+            total_usdt=body.amount_usdt,
+            status=TradeStatus.pending,
+            created_at=datetime.utcnow()
+        )
+        db.add(trade)
+        current_user.paper_balance_usdt = current_balance - body.amount_usdt
+        await db.commit()
+
+        logger.info(f"Manual BUY by {current_user.email}: {body.symbol} qty={quantity} @ ${price}")
+
+        return {
+            "status": "executed",
+            "action": "buy",
+            "symbol": body.symbol,
+            "price": price,
+            "quantity": quantity,
+            "total_usdt": body.amount_usdt,
+            "paper_balance_usdt": current_user.paper_balance_usdt,
+            "message": f"✅ Bought {quantity:.6f} {body.symbol.split('/')[0]} @ ${price:,.2f}"
+        }
+
+    else:  # action == "sell" — only closes an existing open position, never opens a short
+        if not open_trade:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No open position in {body.symbol} to sell. Buy first, then sell to close."
+            )
+
+        current_price = await get_current_price(body.symbol)
+        entry_price = float(open_trade.price or 0)
+        quantity = float(open_trade.quantity or 0)
+        pnl = (current_price - entry_price) * quantity
+
+        open_trade.exit_price = current_price
+        open_trade.status = TradeStatus.executed
+        open_trade.pnl_usdt = round(pnl, 4)
+        open_trade.executed_at = datetime.utcnow()
+
+        principal = float(open_trade.total_usdt or 0)
+        current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
+        await db.commit()
+
+        return {
+            "status": "closed",
+            "action": "sell",
+            "symbol": body.symbol,
+            "entry_price": entry_price,
+            "exit_price": current_price,
+            "quantity": quantity,
+            "pnl_usdt": round(pnl, 4),
+            "paper_balance_usdt": current_user.paper_balance_usdt,
+            "message": f"{'🟢 Profit' if pnl >= 0 else '🔴 Loss'}: ${pnl:+.4f} USDT"
+        }
 
 
 @router.get("/open")
@@ -156,7 +206,7 @@ async def close_trade(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Close/exit an open position — calculates P&L, stores exit price, settles the wallet"""
+    """Close/exit an open position by ID — calculates P&L, stores exit price, settles the wallet"""
     result = await db.execute(
         select(Trade)
         .where(Trade.id == trade_id)
@@ -169,18 +219,13 @@ async def close_trade(
     current_price = await get_current_price(trade.symbol)
     entry_price = float(trade.price or 0)
     quantity = float(trade.quantity or 0)
-
-    if trade.signal == TradeSignal.buy:
-        pnl = (current_price - entry_price) * quantity
-    else:
-        pnl = (entry_price - current_price) * quantity
+    pnl = (current_price - entry_price) * quantity  # spot-only: always long
 
     trade.exit_price = current_price
     trade.status = TradeStatus.executed
     trade.pnl_usdt = round(pnl, 4)
     trade.executed_at = datetime.utcnow()
 
-    # Return the reserved principal + P&L back to the user's paper wallet
     principal = float(trade.total_usdt or 0)
     current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
 
