@@ -40,12 +40,10 @@ CORS_HEADERS = {
     "Access-Control-Max-Age": "86400",
 }
 
-# Handle ALL OPTIONS requests first
 @app.options("/{path:path}")
 async def options_handler(path: str):
     return Response(status_code=200, headers=CORS_HEADERS)
 
-# Add CORS headers to every single response
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -61,7 +59,6 @@ async def cors_middleware(request: Request, call_next):
         response.headers[key] = value
     return response
 
-# Also add FastAPI CORS middleware as backup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -90,6 +87,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 class BotSettingsRequest(BaseModel):
     bot_enabled: bool
     trade_amount_usdt: float = 500.0
+    stop_loss_pct: float = 8.0
+    take_profit_pct: float = 15.0
 
 @app.post("/api/bot/settings")
 async def bot_settings(
@@ -99,11 +98,15 @@ async def bot_settings(
 ):
     current_user.bot_enabled = body.bot_enabled
     current_user.trade_amount_usdt = max(500.0, min(body.trade_amount_usdt, 10000.0))
+    current_user.stop_loss_pct = max(1.0, min(body.stop_loss_pct, 50.0))
+    current_user.take_profit_pct = max(1.0, min(body.take_profit_pct, 100.0))
     await db.commit()
     return {
         "status": "success",
         "bot_enabled": current_user.bot_enabled,
-        "trade_amount_usdt": current_user.trade_amount_usdt
+        "trade_amount_usdt": current_user.trade_amount_usdt,
+        "stop_loss_pct": current_user.stop_loss_pct,
+        "take_profit_pct": current_user.take_profit_pct
     }
 
 @app.get("/api/bot/status")
@@ -111,7 +114,9 @@ async def bot_status(current_user: User = Depends(get_current_user)):
     return {
         "bot_enabled": current_user.bot_enabled,
         "plan": current_user.plan.value if hasattr(current_user.plan, 'value') else str(current_user.plan),
-        "trade_amount_usdt": float(current_user.trade_amount_usdt or 10.0)
+        "trade_amount_usdt": float(current_user.trade_amount_usdt or 500.0),
+        "stop_loss_pct": float(current_user.stop_loss_pct if current_user.stop_loss_pct is not None else 8.0),
+        "take_profit_pct": float(current_user.take_profit_pct if current_user.take_profit_pct is not None else 15.0)
     }
 
 @app.get("/api/bot/history")
@@ -133,9 +138,9 @@ async def bot_history(
             "symbol": t.symbol,
             "signal": t.signal.value if hasattr(t.signal, 'value') else str(t.signal),
             "confidence": float(t.confidence or 0),
-            "price": float(t.price or 0),              # buy/entry price
-            "entry_price": float(t.price or 0),         # kept for backward compatibility
-            "exit_price": float(t.exit_price) if t.exit_price is not None else None,  # sell price, once closed
+            "price": float(t.price or 0),
+            "entry_price": float(t.price or 0),
+            "exit_price": float(t.exit_price) if t.exit_price is not None else None,
             "quantity": float(t.quantity or 0),
             "total_usdt": float(t.total_usdt or 0),
             "pnl_usdt": float(t.pnl_usdt) if t.pnl_usdt is not None else None,
