@@ -32,8 +32,8 @@ MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
 STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
 MIN_CONFIDENCE_PCT = 25           # minimum signal confidence to act on
 
-STOP_LOSS_PCT = -0.08     # -8%  — force-close a losing position
-TAKE_PROFIT_PCT = 0.15    # +15% — force-close a winning position
+DEFAULT_STOP_LOSS_PCT = 8.0     # fallback if a user has no value set — 8% loss
+DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback if a user has no value set — 15% gain
 
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
@@ -394,7 +394,7 @@ async def process_user(user, db):
 
 async def check_stop_loss_take_profit():
     """Runs every 60s for ALL open positions across ALL users, independent of the technical
-    signal. Force-closes anything that has hit -8% (stop-loss) or +15% (take-profit)."""
+    signal. Force-closes anything that has hit that user's own stop-loss or take-profit %."""
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select
@@ -408,7 +408,10 @@ async def check_stop_loss_take_profit():
             if not open_trades:
                 return
 
+            # Cache users we've already looked up this cycle to avoid repeat queries
+            user_cache = {}
             closed_count = 0
+
             for trade in open_trades:
                 entry = float(trade.price or 0)
                 if entry <= 0:
@@ -418,9 +421,18 @@ async def check_stop_loss_take_profit():
                 if current_price <= 0:
                     continue
 
+                user = user_cache.get(trade.user_id)
+                if user is None:
+                    user_result = await db.execute(select(User).where(User.id == trade.user_id))
+                    user = user_result.scalar_one_or_none()
+                    user_cache[trade.user_id] = user
+
+                stop_loss_pct = float(user.stop_loss_pct) if user and user.stop_loss_pct is not None else DEFAULT_STOP_LOSS_PCT
+                take_profit_pct = float(user.take_profit_pct) if user and user.take_profit_pct is not None else DEFAULT_TAKE_PROFIT_PCT
+
                 change_pct = (current_price - entry) / entry
-                hit_stop = change_pct <= STOP_LOSS_PCT
-                hit_target = change_pct >= TAKE_PROFIT_PCT
+                hit_stop = change_pct <= -(stop_loss_pct / 100.0)
+                hit_target = change_pct >= (take_profit_pct / 100.0)
 
                 if not (hit_stop or hit_target):
                     continue
@@ -433,8 +445,6 @@ async def check_stop_loss_take_profit():
                 trade.status = TradeStatus.executed
                 trade.executed_at = datetime.utcnow()
 
-                user_result = await db.execute(select(User).where(User.id == trade.user_id))
-                user = user_result.scalar_one_or_none()
                 if user:
                     principal = float(trade.total_usdt or 0)
                     user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
@@ -443,6 +453,7 @@ async def check_stop_loss_take_profit():
                 emoji = "🛑" if hit_stop else "🎯"
                 logger.info(
                     f"{emoji} {reason} on {trade.symbol}: {change_pct*100:+.2f}% "
+                    f"(threshold -{stop_loss_pct:.1f}%/+{take_profit_pct:.1f}%) "
                     f"— closed @ ${current_price:,.2f}, P&L=${pnl:+.4f}"
                 )
                 closed_count += 1
