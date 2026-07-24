@@ -7,6 +7,11 @@ SPOT-ONLY TRADING MODE:
 - BUY opens a new paper position (only if one isn't already open for that symbol)
 - SELL only closes an existing open position and realizes its P&L
 - There is no shorting — a SELL signal with nothing open is simply ignored
+
+RISK MANAGEMENT:
+- STOP_LOSS_PCT / TAKE_PROFIT_PCT checked every 60s across ALL open positions,
+  independent of the technical signal — closes immediately if hit.
+- 4-hour force-close remains as a final backstop.
 """
 import logging
 import httpx
@@ -26,6 +31,9 @@ MAX_GAINERS = 5              # allow more extra coins per loop
 MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
 STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
 MIN_CONFIDENCE_PCT = 25           # minimum signal confidence to act on
+
+STOP_LOSS_PCT = -0.08     # -8%  — force-close a losing position
+TAKE_PROFIT_PCT = 0.15    # +15% — force-close a winning position
 
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
@@ -60,10 +68,14 @@ class SchedulerManager:
             id="nexus-bot-loop", replace_existing=True
         )
         self.scheduler.add_job(
+            check_stop_loss_take_profit, "interval", seconds=60,
+            id="nexus-risk-check", replace_existing=True
+        )
+        self.scheduler.add_job(
             auto_close_trades, "interval", minutes=10,
             id="nexus-auto-close", replace_existing=True
         )
-        logger.info("✅ Bot scheduler started - 60 second interval")
+        logger.info("✅ Bot scheduler started - signal loop + risk check every 60s")
 
 
 scheduler_manager = SchedulerManager()
@@ -145,7 +157,7 @@ async def fetch_candles(symbol: str) -> list:
 
 
 async def fetch_current_price(symbol: str) -> float:
-    """Get price from Kraken"""
+    """Get price from Kraken only (base pairs)"""
     kraken_pair = KRAKEN_PAIRS.get(symbol)
     if not kraken_pair:
         return 0.0
@@ -162,6 +174,32 @@ async def fetch_current_price(symbol: str) -> float:
     except Exception as e:
         logger.warning(f"Price fetch failed for {symbol}: {e}")
         return 0.0
+
+
+async def get_price_any(symbol: str) -> float:
+    """Get current price for ANY monitored symbol — Kraken primary, CoinGecko fallback.
+    Needed because fetch_current_price() alone only covers the 5 base pairs, not top gainers."""
+    price = await fetch_current_price(symbol)
+    if price > 0:
+        return price
+
+    coin_id = COINGECKO_IDS.get(symbol)
+    if coin_id:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": coin_id, "vs_currencies": "usd"}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                p = data.get(coin_id, {}).get("usd")
+                if p:
+                    return float(p)
+        except Exception as e:
+            logger.warning(f"CoinGecko price fetch failed for {symbol}: {e}")
+
+    return 0.0
 
 
 async def fetch_top_gainers() -> list:
@@ -275,7 +313,6 @@ async def process_user(user, db):
             if signal_str == "hold" or result.confidence < MIN_CONFIDENCE_PCT:
                 continue
 
-            # Look up any existing open (pending) position for this user + symbol
             existing = await db.execute(
                 select(Trade).where(
                     and_(
@@ -347,7 +384,7 @@ async def process_user(user, db):
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 logger.info(
-                    f"{emoji} SOLD {symbol} @ ${current_price:,.2f} — closed position, "
+                    f"{emoji} SOLD {symbol} @ ${current_price:,.2f} — closed position (signal), "
                     f"P&L=${pnl:+.4f} (balance now ${user.paper_balance_usdt:.2f})"
                 )
 
@@ -355,8 +392,75 @@ async def process_user(user, db):
             logger.error(f"Error for {symbol}: {e}", exc_info=True)
 
 
+async def check_stop_loss_take_profit():
+    """Runs every 60s for ALL open positions across ALL users, independent of the technical
+    signal. Force-closes anything that has hit -8% (stop-loss) or +15% (take-profit)."""
+    try:
+        from database import get_db, Trade, TradeStatus, User
+        from sqlalchemy import select
+
+        async_gen = get_db()
+        db = await async_gen.__anext__()
+
+        try:
+            result = await db.execute(select(Trade).where(Trade.status == TradeStatus.pending))
+            open_trades = result.scalars().all()
+            if not open_trades:
+                return
+
+            closed_count = 0
+            for trade in open_trades:
+                entry = float(trade.price or 0)
+                if entry <= 0:
+                    continue
+
+                current_price = await get_price_any(trade.symbol)
+                if current_price <= 0:
+                    continue
+
+                change_pct = (current_price - entry) / entry
+                hit_stop = change_pct <= STOP_LOSS_PCT
+                hit_target = change_pct >= TAKE_PROFIT_PCT
+
+                if not (hit_stop or hit_target):
+                    continue
+
+                qty = float(trade.quantity or 0)
+                pnl = (current_price - entry) * qty
+
+                trade.exit_price = current_price
+                trade.pnl_usdt = round(pnl, 4)
+                trade.status = TradeStatus.executed
+                trade.executed_at = datetime.utcnow()
+
+                user_result = await db.execute(select(User).where(User.id == trade.user_id))
+                user = user_result.scalar_one_or_none()
+                if user:
+                    principal = float(trade.total_usdt or 0)
+                    user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
+
+                reason = "STOP-LOSS" if hit_stop else "TAKE-PROFIT"
+                emoji = "🛑" if hit_stop else "🎯"
+                logger.info(
+                    f"{emoji} {reason} on {trade.symbol}: {change_pct*100:+.2f}% "
+                    f"— closed @ ${current_price:,.2f}, P&L=${pnl:+.4f}"
+                )
+                closed_count += 1
+
+            if closed_count:
+                await db.commit()
+                logger.info(f"Risk check closed {closed_count} position(s)")
+
+        finally:
+            await db.close()
+
+    except Exception as e:
+        logger.error(f"Stop-loss/take-profit check error: {e}", exc_info=True)
+
+
 async def auto_close_trades():
-    """Safety net: force-close any position still open after 4 hours, settle wallet."""
+    """Final safety net: force-close any position still open after 4 hours, settle wallet.
+    Uses get_price_any() so this also works for top-gainer symbols, not just base pairs."""
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select, and_
@@ -383,14 +487,13 @@ async def auto_close_trades():
             logger.info(f"Auto-closing {len(trades)} trades (held over 4 hours)")
 
             for trade in trades:
-                current_price = await fetch_current_price(trade.symbol)
+                current_price = await get_price_any(trade.symbol)
                 if current_price <= 0:
                     continue
 
                 entry = float(trade.price or 0)
                 qty = float(trade.quantity or 0)
-                # Spot-only: every open position is a buy/long, so P&L is always (exit - entry) * qty
-                pnl = (current_price - entry) * qty
+                pnl = (current_price - entry) * qty  # spot-only: always long
 
                 trade.exit_price = current_price
                 trade.pnl_usdt = round(pnl, 4)
