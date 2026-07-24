@@ -176,7 +176,7 @@ async def get_open_trades(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get open/pending positions for the user"""
+    """Get open/pending positions for the user, including their stop-loss/take-profit price levels"""
     result = await db.execute(
         select(Trade)
         .where(Trade.user_id == current_user.id)
@@ -185,19 +185,30 @@ async def get_open_trades(
         .limit(50)
     )
     trades = result.scalars().all()
-    return [
-        {
+
+    stop_loss_pct = float(current_user.stop_loss_pct if current_user.stop_loss_pct is not None else 8.0)
+    take_profit_pct = float(current_user.take_profit_pct if current_user.take_profit_pct is not None else 15.0)
+
+    output = []
+    for t in trades:
+        entry = float(t.price or 0)
+        stop_loss_price = round(entry * (1 - stop_loss_pct / 100.0), 6) if entry > 0 else None
+        take_profit_price = round(entry * (1 + take_profit_pct / 100.0), 6) if entry > 0 else None
+        output.append({
             "id": t.id,
             "symbol": t.symbol,
             "signal": t.signal.value if hasattr(t.signal, 'value') else str(t.signal),
-            "price": float(t.price or 0),
+            "price": entry,
             "quantity": float(t.quantity or 0),
             "total_usdt": float(t.total_usdt or 0),
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+            "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct,
             "status": t.status.value if hasattr(t.status, 'value') else str(t.status),
             "created_at": t.created_at.isoformat() if t.created_at else None,
-        }
-        for t in trades
-    ]
+        })
+    return output
 
 
 @router.post("/close/{trade_id}")
