@@ -119,6 +119,7 @@ class Trade(Base):
     price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     exit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    coingecko_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # saved at open time so price lookups survive restarts
 
     rsi: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     macd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -184,6 +185,9 @@ async def run_migrations():
         ))
         await conn.execute(text(
             "UPDATE users SET take_profit_pct = 15.0 WHERE take_profit_pct IS NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS coingecko_id VARCHAR"
         ))
 
 async def get_db():
