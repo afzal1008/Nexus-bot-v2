@@ -8,10 +8,17 @@ SPOT-ONLY TRADING MODE:
 - SELL only closes an existing open position and realizes its P&L
 - There is no shorting — a SELL signal with nothing open is simply ignored
 
-RISK MANAGEMENT:
-- STOP_LOSS_PCT / TAKE_PROFIT_PCT checked every 60s across ALL open positions,
-  independent of the technical signal — closes immediately if hit.
+RISK MANAGEMENT (v3):
+- Each trade gets its own ATR-based stop-loss/take-profit, sized to that coin's
+  actual recent volatility, capped by the user's configured max % as a safety ceiling.
+- A 60s background check force-closes anything that hits its stop/target,
+  independent of the technical signal.
 - 4-hour force-close remains as a final backstop.
+
+SIGNAL QUALITY (v3):
+- Confidence threshold raised to 40% (was 25%) — requires broader indicator agreement.
+- ADX trend-strength filter discounts MACD/EMA signals in choppy/ranging markets.
+- CoinGecko fallback lookback extended to 30 days (was 7) for more stable indicators.
 """
 import logging
 import httpx
@@ -30,10 +37,16 @@ MAX_GAINERS = 5              # allow more extra coins per loop
 
 MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
 STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
-MIN_CONFIDENCE_PCT = 25           # minimum signal confidence to act on
+MIN_CONFIDENCE_PCT = 40           # minimum signal confidence to act on (raised from 25)
 
-DEFAULT_STOP_LOSS_PCT = 8.0     # fallback if a user has no value set — 8% loss
-DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback if a user has no value set — 15% gain
+DEFAULT_STOP_LOSS_PCT = 8.0     # fallback cap if a user has no value set — 8% loss
+DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback cap if a user has no value set — 15% gain
+
+# ATR-based stop/target multipliers — the actual per-trade levels, capped by the user's settings
+ATR_STOP_MULTIPLIER = 1.5     # stop-loss = 1.5x ATR% away from entry
+ATR_TARGET_MULTIPLIER = 3.0   # take-profit = 3x ATR% away from entry (≈2:1 reward:risk vs the stop)
+MIN_STOP_PCT = 2.0             # never set a stop tighter than this, even on very calm coins
+MIN_TARGET_PCT = 3.0           # never set a target tighter than this
 
 # Kraken uses different pair names
 KRAKEN_PAIRS = {
@@ -52,9 +65,8 @@ COINGECKO_IDS = {
     "XRP/USDT": "ripple"
 }
 
-# Cache for top-gainers lookup (avoids hammering CoinGecko every 60s)
 _gainers_cache = {"data": [], "fetched_at": None}
-GAINERS_CACHE_SECONDS = 300   # only refetch every 5 minutes
+GAINERS_CACHE_SECONDS = 300
 
 
 class SchedulerManager:
@@ -82,7 +94,9 @@ scheduler_manager = SchedulerManager()
 
 
 async def fetch_candles_kraken(symbol: str) -> list:
-    """Fetch from Kraken - free, no auth needed, works everywhere"""
+    """Fetch from Kraken - free, no auth needed, works everywhere.
+    interval=60 (60-minute candles) with Kraken's default ~720-candle return
+    already gives ~30 days of history."""
     kraken_pair = KRAKEN_PAIRS.get(symbol)
     if not kraken_pair:
         return []
@@ -120,14 +134,14 @@ async def fetch_candles_kraken(symbol: str) -> list:
 
 
 async def fetch_candles_coingecko(symbol: str) -> list:
-    """Fallback: CoinGecko"""
+    """Fallback: CoinGecko — 30 days (was 7) for more stable MACD/EMA/ADX readings"""
     coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
     try:
         await asyncio.sleep(2)  # Rate limit delay
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
-                params={"vs_currency": "usd", "days": "7"}
+                params={"vs_currency": "usd", "days": "30"}
             )
             resp.raise_for_status()
             raw = resp.json()
@@ -192,7 +206,7 @@ async def resolve_coingecko_id(symbol: str) -> str:
             coins = data.get("coins", [])
             for c in coins:
                 if c.get("symbol", "").upper() == base.upper():
-                    COINGECKO_IDS[symbol] = c.get("id")  # repopulate cache for this process
+                    COINGECKO_IDS[symbol] = c.get("id")
                     return c.get("id")
             if coins:
                 coin_id = coins[0].get("id")
@@ -205,7 +219,6 @@ async def resolve_coingecko_id(symbol: str) -> str:
 
 async def get_price_any(symbol: str, coingecko_id: str = None) -> float:
     """Get current price for ANY monitored symbol — Kraken primary, CoinGecko fallback.
-    Needed because fetch_current_price() alone only covers the 5 base pairs, not top gainers.
     Pass coingecko_id (saved on the Trade row) so this survives the in-memory cache resetting."""
     price = await fetch_current_price(symbol)
     if price > 0:
@@ -268,7 +281,7 @@ async def fetch_top_gainers() -> list:
             return gainers
     except Exception as e:
         logger.warning(f"Top gainers fetch failed: {e}")
-        return _gainers_cache["data"]   # reuse last known good list instead of going empty
+        return _gainers_cache["data"]
 
 
 async def bot_main_loop():
@@ -311,11 +324,24 @@ async def bot_main_loop():
         logger.error(f"❌ Bot loop error: {e}", exc_info=True)
 
 
+def compute_atr_levels(entry_price: float, atr_pct: float, user_stop_cap_pct: float, user_target_cap_pct: float):
+    """Turn a coin's ATR% into an actual stop-loss/take-profit price, sized to that
+    coin's own volatility but capped by the user's configured safety limits."""
+    stop_pct = max(MIN_STOP_PCT, min(atr_pct * ATR_STOP_MULTIPLIER, user_stop_cap_pct))
+    target_pct = max(MIN_TARGET_PCT, min(atr_pct * ATR_TARGET_MULTIPLIER, user_target_cap_pct * 1.5))
+    stop_loss_price = round(entry_price * (1 - stop_pct / 100.0), 8)
+    take_profit_price = round(entry_price * (1 + target_pct / 100.0), 8)
+    return stop_loss_price, take_profit_price, stop_pct, target_pct
+
+
 async def process_user(user, db):
     """Spot-only logic: BUY opens a position, SELL only closes an existing one. No shorting."""
     from signal_engine import generate_signal
     from database import Trade, TradeStatus
     from sqlalchemy import select, and_
+
+    stop_cap = float(user.stop_loss_pct) if getattr(user, "stop_loss_pct", None) is not None else DEFAULT_STOP_LOSS_PCT
+    target_cap = float(user.take_profit_pct) if getattr(user, "take_profit_pct", None) is not None else DEFAULT_TAKE_PROFIT_PCT
 
     for symbol in PAIRS:
         try:
@@ -327,7 +353,7 @@ async def process_user(user, db):
                 continue
 
             result = generate_signal(candles)
-            candle_price = candles[-1]["close"]  # used for RSI/MACD/EMA calculation — can lag by hours for thin coins
+            candle_price = candles[-1]["close"]  # used for RSI/MACD/EMA/ADX/ATR calculation — can lag by hours for thin coins
 
             if isinstance(result.signal, str):
                 signal_str = result.signal.lower()
@@ -338,7 +364,7 @@ async def process_user(user, db):
                 f"[{symbol}] {signal_str.upper()} "
                 f"conf={result.confidence}% "
                 f"price=${candle_price:,.2f} "
-                f"RSI={result.rsi}"
+                f"RSI={result.rsi} ADX={result.adx} ATR%={result.atr_pct}"
             )
 
             if signal_str == "hold" or result.confidence < MIN_CONFIDENCE_PCT:
@@ -370,15 +396,15 @@ async def process_user(user, db):
                     )
                     continue
 
-                # Use a genuinely LIVE price for the actual entry, not the (possibly hours-old)
-                # candle close — this is what the stop-loss/take-profit check compares against
-                # later, so entry and exit must both be measured the same way to avoid a false
-                # "instant stop-loss" from comparing stale vs. live prices.
                 coingecko_id = COINGECKO_IDS.get(symbol)
                 live_price = await get_price_any(symbol, coingecko_id)
                 entry_price = live_price if live_price > 0 else candle_price
 
                 qty = round(trade_amount / entry_price, 8) if entry_price > 0 else 0
+
+                sl_price, tp_price, sl_pct, tp_pct = compute_atr_levels(
+                    entry_price, result.atr_pct, stop_cap, target_cap
+                )
 
                 trade = Trade(
                     user_id=user.id,
@@ -393,6 +419,8 @@ async def process_user(user, db):
                     macd=result.macd,
                     bb_position=result.bb_position,
                     coingecko_id=coingecko_id,
+                    stop_loss_price=sl_price,
+                    take_profit_price=tp_price,
                     status=TradeStatus.pending,
                     created_at=datetime.utcnow()
                 )
@@ -403,6 +431,7 @@ async def process_user(user, db):
                     f"✅ BOUGHT {symbol} @ ${entry_price:,.2f} (live) "
                     f"[candle close was ${candle_price:,.2f}] "
                     f"qty={qty} amount=${trade_amount:.2f} "
+                    f"ATR-stop=${sl_price:,.4f} ({sl_pct:.1f}%) ATR-target=${tp_price:,.4f} ({tp_pct:.1f}%) "
                     f"(balance now ${user.paper_balance_usdt:.2f})"
                 )
 
@@ -439,7 +468,8 @@ async def process_user(user, db):
 
 async def check_stop_loss_take_profit():
     """Runs every 60s for ALL open positions across ALL users, independent of the technical
-    signal. Force-closes anything that has hit that user's own stop-loss or take-profit %."""
+    signal. Uses each trade's own ATR-based stop/target price if set; falls back to the
+    user's fixed percentage for any older trade that predates the ATR feature."""
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select
@@ -453,7 +483,6 @@ async def check_stop_loss_take_profit():
             if not open_trades:
                 return
 
-            # Cache users we've already looked up this cycle to avoid repeat queries
             user_cache = {}
             closed_count = 0
 
@@ -472,12 +501,16 @@ async def check_stop_loss_take_profit():
                     user = user_result.scalar_one_or_none()
                     user_cache[trade.user_id] = user
 
-                stop_loss_pct = float(user.stop_loss_pct) if user and user.stop_loss_pct is not None else DEFAULT_STOP_LOSS_PCT
-                take_profit_pct = float(user.take_profit_pct) if user and user.take_profit_pct is not None else DEFAULT_TAKE_PROFIT_PCT
-
-                change_pct = (current_price - entry) / entry
-                hit_stop = change_pct <= -(stop_loss_pct / 100.0)
-                hit_target = change_pct >= (take_profit_pct / 100.0)
+                if trade.stop_loss_price is not None and trade.take_profit_price is not None:
+                    hit_stop = current_price <= trade.stop_loss_price
+                    hit_target = current_price >= trade.take_profit_price
+                else:
+                    # Legacy fallback for trades opened before ATR-based levels existed
+                    stop_loss_pct = float(user.stop_loss_pct) if user and user.stop_loss_pct is not None else DEFAULT_STOP_LOSS_PCT
+                    take_profit_pct = float(user.take_profit_pct) if user and user.take_profit_pct is not None else DEFAULT_TAKE_PROFIT_PCT
+                    change_pct = (current_price - entry) / entry
+                    hit_stop = change_pct <= -(stop_loss_pct / 100.0)
+                    hit_target = change_pct >= (take_profit_pct / 100.0)
 
                 if not (hit_stop or hit_target):
                     continue
@@ -494,11 +527,11 @@ async def check_stop_loss_take_profit():
                     principal = float(trade.total_usdt or 0)
                     user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
 
+                change_pct_display = ((current_price - entry) / entry) * 100
                 reason = "STOP-LOSS" if hit_stop else "TAKE-PROFIT"
                 emoji = "🛑" if hit_stop else "🎯"
                 logger.info(
-                    f"{emoji} {reason} on {trade.symbol}: {change_pct*100:+.2f}% "
-                    f"(threshold -{stop_loss_pct:.1f}%/+{take_profit_pct:.1f}%) "
+                    f"{emoji} {reason} on {trade.symbol}: {change_pct_display:+.2f}% "
                     f"— closed @ ${current_price:,.2f}, P&L=${pnl:+.4f}"
                 )
                 closed_count += 1
@@ -515,8 +548,7 @@ async def check_stop_loss_take_profit():
 
 
 async def auto_close_trades():
-    """Final safety net: force-close any position still open after 4 hours, settle wallet.
-    Uses get_price_any() so this also works for top-gainer symbols, not just base pairs."""
+    """Final safety net: force-close any position still open after 4 hours, settle wallet."""
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select, and_
@@ -549,7 +581,7 @@ async def auto_close_trades():
 
                 entry = float(trade.price or 0)
                 qty = float(trade.quantity or 0)
-                pnl = (current_price - entry) * qty  # spot-only: always long
+                pnl = (current_price - entry) * qty
 
                 trade.exit_price = current_price
                 trade.pnl_usdt = round(pnl, 4)
