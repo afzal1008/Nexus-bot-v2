@@ -68,6 +68,9 @@ COINGECKO_IDS = {
 _gainers_cache = {"data": [], "fetched_at": None}
 GAINERS_CACHE_SECONDS = 300
 
+_candles_cache = {}  # symbol -> {"data": [...], "fetched_at": datetime}
+CANDLES_CACHE_SECONDS = 300  # 5 minutes — avoids re-fetching full OHLC every 60s loop
+
 
 class SchedulerManager:
     def __init__(self):
@@ -134,7 +137,14 @@ async def fetch_candles_kraken(symbol: str) -> list:
 
 
 async def fetch_candles_coingecko(symbol: str) -> list:
-    """Fallback: CoinGecko — 30 days (was 7) for more stable MACD/EMA/ADX readings"""
+    """Fallback: CoinGecko — 30 days (was 7) for more stable MACD/EMA/ADX readings.
+    Cached for 5 minutes per symbol to avoid hammering CoinGecko's free-tier rate limit
+    every 60-second loop — indicators don't meaningfully change minute-to-minute anyway."""
+    now = datetime.utcnow()
+    cached = _candles_cache.get(symbol)
+    if cached and (now - cached["fetched_at"]).total_seconds() < CANDLES_CACHE_SECONDS:
+        return cached["data"]
+
     coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
     try:
         await asyncio.sleep(2)  # Rate limit delay
@@ -145,7 +155,7 @@ async def fetch_candles_coingecko(symbol: str) -> list:
             )
             resp.raise_for_status()
             raw = resp.json()
-            return [
+            candles = [
                 {
                     "timestamp": c[0],
                     "open":   float(c[1]),
@@ -156,8 +166,13 @@ async def fetch_candles_coingecko(symbol: str) -> list:
                 }
                 for c in raw
             ]
+            _candles_cache[symbol] = {"data": candles, "fetched_at": now}
+            return candles
     except Exception as e:
         logger.warning(f"CoinGecko failed for {symbol}: {e}")
+        if cached:
+            logger.info(f"Using stale cached candles for {symbol} (rate limited)")
+            return cached["data"]
         return []
 
 
