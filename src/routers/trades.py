@@ -9,10 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, and_
 from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
-from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT
+from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT, get_price_any, resolve_coingecko_id
 from pydantic import BaseModel
 from datetime import datetime
-import httpx
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,42 +24,12 @@ class ManualTradeRequest(BaseModel):
     amount_usdt: float   # how much paper USDT to use (ignored for "sell" — uses the open position's size)
 
 
-async def get_current_price(symbol: str) -> float:
-    """Fetch live price - Kraken primary, CoinGecko fallback.
-    (Binance blocks many hosting regions with HTTP 451, so we don't use it here.)"""
-    kraken_pair = KRAKEN_PAIRS.get(symbol)
-    if kraken_pair:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.get(
-                    "https://api.kraken.com/0/public/Ticker",
-                    params={"pair": kraken_pair}
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                result = data.get("result", {})
-                if result and not data.get("error"):
-                    pair_key = list(result.keys())[0]
-                    return float(result[pair_key]["c"][0])
-        except Exception as e:
-            logger.warning(f"Kraken price fetch failed for {symbol}: {e}")
-
-    coin_id = COINGECKO_IDS.get(symbol)
-    if coin_id:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": coin_id, "vs_currencies": "usd"}
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                price = data.get(coin_id, {}).get("usd")
-                if price:
-                    return float(price)
-        except Exception as e:
-            logger.warning(f"CoinGecko price fetch failed for {symbol}: {e}")
-
+async def get_current_price(symbol: str, coingecko_id: str = None) -> float:
+    """Fetch live price - Kraken primary, CoinGecko fallback (via bot_engine's shared,
+    restart-resilient lookup). Raises if no source has a price."""
+    price = await get_price_any(symbol, coingecko_id)
+    if price > 0:
+        return price
     raise HTTPException(status_code=503, detail=f"Could not fetch price for {symbol} from any source")
 
 
@@ -105,7 +74,11 @@ async def manual_trade(
                 detail=f"Insufficient paper balance: ${current_balance:.2f} available, ${body.amount_usdt:.2f} requested"
             )
 
-        price = await get_current_price(body.symbol)
+        coin_id = COINGECKO_IDS.get(body.symbol)
+        if not coin_id:
+            coin_id = await resolve_coingecko_id(body.symbol)
+
+        price = await get_current_price(body.symbol, coin_id)
         quantity = round(body.amount_usdt / price, 8)
 
         trade = Trade(
@@ -117,6 +90,7 @@ async def manual_trade(
             price=price,
             quantity=quantity,
             total_usdt=body.amount_usdt,
+            coingecko_id=coin_id,
             status=TradeStatus.pending,
             created_at=datetime.utcnow()
         )
@@ -144,7 +118,7 @@ async def manual_trade(
                 detail=f"No open position in {body.symbol} to sell. Buy first, then sell to close."
             )
 
-        current_price = await get_current_price(body.symbol)
+        current_price = await get_current_price(body.symbol, open_trade.coingecko_id)
         entry_price = float(open_trade.price or 0)
         quantity = float(open_trade.quantity or 0)
         pnl = (current_price - entry_price) * quantity
@@ -227,7 +201,7 @@ async def close_trade(
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    current_price = await get_current_price(trade.symbol)
+    current_price = await get_current_price(trade.symbol, trade.coingecko_id)
     entry_price = float(trade.price or 0)
     quantity = float(trade.quantity or 0)
     pnl = (current_price - entry_price) * quantity  # spot-only: always long
