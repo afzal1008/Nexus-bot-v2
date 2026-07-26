@@ -1,6 +1,11 @@
 """
 Signal Engine - Multi-indicator AI trading signal generator
 Pure Python implementation - no pandas/numpy required
+
+v2: adds ADX (trend-strength filter) and ATR (volatility, used for dynamic
+stop-loss/take-profit sizing). MACD/EMA trend-following points are discounted
+when ADX shows a weak/ranging market, since those indicators are unreliable
+outside real trends.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -22,6 +27,9 @@ class SignalResult:
     bb_position: str
     volume_signal: str
     pattern: str
+    adx: float
+    atr: float
+    atr_pct: float
     reasoning: str
 
 
@@ -124,6 +132,84 @@ def detect_pattern(candles: list) -> str:
     return "none"
 
 
+def calculate_atr(candles: list, period: int = 14) -> float:
+    """Average True Range — measures how much a coin actually moves, in price units.
+    Used to size stop-loss/take-profit relative to each coin's own volatility
+    instead of a single fixed percentage for every coin."""
+    if len(candles) < period + 1:
+        # Not enough history — fall back to a rough 2% of price as a conservative estimate
+        return candles[-1]["close"] * 0.02
+
+    trs = []
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+
+    recent_trs = trs[-period:]
+    atr = sum(recent_trs) / period
+    return round(atr, 8)
+
+
+def _wilder_smooth(values: list, period: int) -> list:
+    """Wilder's smoothing method — used for ADX's DM/TR averaging."""
+    if len(values) < period:
+        avg = sum(values) / len(values) if values else 0
+        return [avg]
+    smoothed = sum(values[:period])
+    result = [smoothed]
+    for v in values[period:]:
+        smoothed = smoothed - (smoothed / period) + v
+        result.append(smoothed)
+    return result
+
+
+def calculate_adx(candles: list, period: int = 14) -> float:
+    """Average Directional Index — measures TREND STRENGTH (not direction).
+    ADX > 25: real trend underway, MACD/EMA-style signals are reliable.
+    ADX < 20: choppy/ranging market, trend-following signals are unreliable
+    and should be discounted in favor of mean-reversion signals (RSI, Bollinger).
+    This is a simplified approximation of the standard ADX calculation —
+    good enough as a trend-strength filter, not intended for precise charting."""
+    if len(candles) < period * 2:
+        return 15.0  # not enough data — treat as weak/neutral trend (conservative, discounts trend signals)
+
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(candles)):
+        up_move = candles[i]["high"] - candles[i-1]["high"]
+        down_move = candles[i-1]["low"] - candles[i]["low"]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    smoothed_tr = _wilder_smooth(trs, period)
+    smoothed_plus_dm = _wilder_smooth(plus_dm, period)
+    smoothed_minus_dm = _wilder_smooth(minus_dm, period)
+
+    n = min(len(smoothed_tr), len(smoothed_plus_dm), len(smoothed_minus_dm))
+    dx_values = []
+    for i in range(n):
+        str_ = smoothed_tr[i]
+        if str_ == 0:
+            dx_values.append(0)
+            continue
+        plus_di = 100 * (smoothed_plus_dm[i] / str_)
+        minus_di = 100 * (smoothed_minus_dm[i] / str_)
+        di_sum = plus_di + minus_di
+        dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+        dx_values.append(dx)
+
+    if not dx_values:
+        return 15.0
+    window = dx_values[-period:] if len(dx_values) >= period else dx_values
+    return round(sum(window) / len(window), 2)
+
+
 def generate_signal(candles: list) -> SignalResult:
     closes  = [c["close"]  for c in candles]
     volumes = [c["volume"] for c in candles]
@@ -134,11 +220,19 @@ def generate_signal(candles: list) -> SignalResult:
     bb_upper, bb_lower, bb_mid, bb_pos = calculate_bollinger(closes)
     vol_signal                       = calculate_volume_signal(volumes)
     pattern                          = detect_pattern(candles)
+    adx                              = calculate_adx(candles)
+    atr                              = calculate_atr(candles)
+    atr_pct                          = round((atr / closes[-1]) * 100, 3) if closes[-1] > 0 else 2.0
+
+    # Trend-strength filter: discount trend-following signals (MACD, EMA) when
+    # ADX shows a weak/ranging market — they're unreliable outside real trends.
+    trend_multiplier = 1.0 if adx >= 25 else (0.5 if adx < 20 else 0.75)
 
     buy_score  = 0
     sell_score = 0
     reasons    = []
 
+    # Mean-reversion signals (RSI, Bollinger) — reliable regardless of trend regime
     if rsi < 30:
         buy_score += 25; reasons.append(f"RSI oversold ({rsi})")
     elif rsi < 40:
@@ -148,20 +242,25 @@ def generate_signal(candles: list) -> SignalResult:
     elif rsi > 60:
         sell_score += 10; reasons.append(f"RSI approaching overbought ({rsi})")
 
-    if macd > macd_sig and macd_hist > 0:
-        buy_score += 20; reasons.append("MACD bullish crossover")
-    elif macd < macd_sig and macd_hist < 0:
-        sell_score += 20; reasons.append("MACD bearish crossover")
-
-    if ema_fast > ema_slow:
-        buy_score += 15; reasons.append("EMA fast above slow (bullish)")
-    elif ema_fast < ema_slow:
-        sell_score += 15; reasons.append("EMA fast below slow (bearish)")
-
     if bb_pos == "below_lower":
         buy_score += 20; reasons.append("Price below Bollinger lower band")
     elif bb_pos == "above_upper":
         sell_score += 20; reasons.append("Price above Bollinger upper band")
+
+    # Trend-following signals (MACD, EMA) — discounted in weak/ranging markets
+    if macd > macd_sig and macd_hist > 0:
+        pts = round(20 * trend_multiplier)
+        buy_score += pts; reasons.append(f"MACD bullish crossover (x{trend_multiplier}, ADX={adx})")
+    elif macd < macd_sig and macd_hist < 0:
+        pts = round(20 * trend_multiplier)
+        sell_score += pts; reasons.append(f"MACD bearish crossover (x{trend_multiplier}, ADX={adx})")
+
+    if ema_fast > ema_slow:
+        pts = round(15 * trend_multiplier)
+        buy_score += pts; reasons.append(f"EMA fast above slow, bullish (x{trend_multiplier})")
+    elif ema_fast < ema_slow:
+        pts = round(15 * trend_multiplier)
+        sell_score += pts; reasons.append(f"EMA fast below slow, bearish (x{trend_multiplier})")
 
     if vol_signal == "high":
         if buy_score > sell_score:
@@ -206,6 +305,9 @@ def generate_signal(candles: list) -> SignalResult:
         bb_position=bb_pos,
         volume_signal=vol_signal,
         pattern=pattern,
+        adx=adx,
+        atr=atr,
+        atr_pct=atr_pct,
         reasoning=" | ".join(reasons) if reasons else "No strong signal"
     )
 
