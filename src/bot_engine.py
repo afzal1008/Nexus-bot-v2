@@ -337,7 +337,7 @@ async def process_user(user, db):
             logger.info(
                 f"[{symbol}] {signal_str.upper()} "
                 f"conf={result.confidence}% "
-                f"price=${current_price:,.2f} "
+                f"price=${candle_price:,.2f} "
                 f"RSI={result.rsi}"
             )
 
