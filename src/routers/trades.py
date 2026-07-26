@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, and_
 from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
-from bot_engine import KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT, get_price_any, resolve_coingecko_id
+from bot_engine import (
+    KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT, get_price_any, resolve_coingecko_id,
+    fetch_candles, compute_atr_levels, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT
+)
+from signal_engine import calculate_atr
 from pydantic import BaseModel
 from datetime import datetime
 import logging
@@ -81,6 +85,18 @@ async def manual_trade(
         price = await get_current_price(body.symbol, coin_id)
         quantity = round(body.amount_usdt / price, 8)
 
+        # Compute the same ATR-based stop-loss/take-profit used by the automated bot,
+        # so manual trades get the same volatility-aware protection
+        stop_cap = float(current_user.stop_loss_pct) if current_user.stop_loss_pct is not None else DEFAULT_STOP_LOSS_PCT
+        target_cap = float(current_user.take_profit_pct) if current_user.take_profit_pct is not None else DEFAULT_TAKE_PROFIT_PCT
+        try:
+            candles = await fetch_candles(body.symbol)
+            atr = calculate_atr(candles) if len(candles) >= 10 else price * 0.02
+            atr_pct = (atr / price) * 100 if price > 0 else 2.0
+        except Exception:
+            atr_pct = 2.0  # conservative fallback if candle fetch fails
+        sl_price, tp_price, _, _ = compute_atr_levels(price, atr_pct, stop_cap, target_cap)
+
         trade = Trade(
             user_id=current_user.id,
             exchange_name="paper_trading",
@@ -91,6 +107,8 @@ async def manual_trade(
             quantity=quantity,
             total_usdt=body.amount_usdt,
             coingecko_id=coin_id,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
             status=TradeStatus.pending,
             created_at=datetime.utcnow()
         )
@@ -166,8 +184,14 @@ async def get_open_trades(
     output = []
     for t in trades:
         entry = float(t.price or 0)
-        stop_loss_price = round(entry * (1 - stop_loss_pct / 100.0), 6) if entry > 0 else None
-        take_profit_price = round(entry * (1 + take_profit_pct / 100.0), 6) if entry > 0 else None
+        # Prefer the ATR-based levels saved on the trade itself; fall back to the
+        # flat percentage calc only for trades opened before this feature existed
+        if t.stop_loss_price is not None and t.take_profit_price is not None:
+            stop_loss_price = t.stop_loss_price
+            take_profit_price = t.take_profit_price
+        else:
+            stop_loss_price = round(entry * (1 - stop_loss_pct / 100.0), 6) if entry > 0 else None
+            take_profit_price = round(entry * (1 + take_profit_pct / 100.0), 6) if entry > 0 else None
         output.append({
             "id": t.id,
             "symbol": t.symbol,
