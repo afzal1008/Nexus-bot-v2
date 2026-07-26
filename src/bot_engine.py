@@ -176,14 +176,45 @@ async def fetch_current_price(symbol: str) -> float:
         return 0.0
 
 
-async def get_price_any(symbol: str) -> float:
+async def resolve_coingecko_id(symbol: str) -> str:
+    """Last-resort lookup: find a coin's CoinGecko id via live search.
+    Needed because COINGECKO_IDS is in-memory only and resets on every restart/redeploy —
+    this recovers price lookups for a symbol whose id was lost from memory."""
+    base = symbol.split("/")[0]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/search",
+                params={"query": base}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            coins = data.get("coins", [])
+            for c in coins:
+                if c.get("symbol", "").upper() == base.upper():
+                    COINGECKO_IDS[symbol] = c.get("id")  # repopulate cache for this process
+                    return c.get("id")
+            if coins:
+                coin_id = coins[0].get("id")
+                COINGECKO_IDS[symbol] = coin_id
+                return coin_id
+    except Exception as e:
+        logger.warning(f"CoinGecko search failed for {symbol}: {e}")
+    return None
+
+
+async def get_price_any(symbol: str, coingecko_id: str = None) -> float:
     """Get current price for ANY monitored symbol — Kraken primary, CoinGecko fallback.
-    Needed because fetch_current_price() alone only covers the 5 base pairs, not top gainers."""
+    Needed because fetch_current_price() alone only covers the 5 base pairs, not top gainers.
+    Pass coingecko_id (saved on the Trade row) so this survives the in-memory cache resetting."""
     price = await fetch_current_price(symbol)
     if price > 0:
         return price
 
-    coin_id = COINGECKO_IDS.get(symbol)
+    coin_id = coingecko_id or COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        coin_id = await resolve_coingecko_id(symbol)
+
     if coin_id:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -353,6 +384,7 @@ async def process_user(user, db):
                     rsi=result.rsi,
                     macd=result.macd,
                     bb_position=result.bb_position,
+                    coingecko_id=COINGECKO_IDS.get(symbol),
                     status=TradeStatus.pending,
                     created_at=datetime.utcnow()
                 )
@@ -417,7 +449,7 @@ async def check_stop_loss_take_profit():
                 if entry <= 0:
                     continue
 
-                current_price = await get_price_any(trade.symbol)
+                current_price = await get_price_any(trade.symbol, trade.coingecko_id)
                 if current_price <= 0:
                     continue
 
@@ -498,7 +530,7 @@ async def auto_close_trades():
             logger.info(f"Auto-closing {len(trades)} trades (held over 4 hours)")
 
             for trade in trades:
-                current_price = await get_price_any(trade.symbol)
+                current_price = await get_price_any(trade.symbol, trade.coingecko_id)
                 if current_price <= 0:
                     continue
 
