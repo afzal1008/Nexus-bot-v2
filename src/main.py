@@ -124,13 +124,29 @@ async def bot_history(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(
+    """Trade history — open/pending positions always shown first (most recent first),
+    followed by executed/closed trades (also most recent first)."""
+
+    pending_result = await db.execute(
         select(Trade)
         .where(Trade.user_id == current_user.id)
+        .where(Trade.status == TradeStatus.pending)
         .order_by(Trade.created_at.desc())
-        .limit(100)
     )
-    trades = result.scalars().all()
+    pending_trades = pending_result.scalars().all()
+
+    remaining_slots = max(0, 100 - len(pending_trades))
+    executed_result = await db.execute(
+        select(Trade)
+        .where(Trade.user_id == current_user.id)
+        .where(Trade.status != TradeStatus.pending)
+        .order_by(Trade.created_at.desc())
+        .limit(remaining_slots)
+    )
+    executed_trades = executed_result.scalars().all()
+
+    trades = list(pending_trades) + list(executed_trades)
+
     return [
         {
             "id": t.id,
