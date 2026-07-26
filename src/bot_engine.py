@@ -327,7 +327,7 @@ async def process_user(user, db):
                 continue
 
             result = generate_signal(candles)
-            current_price = candles[-1]["close"]
+            candle_price = candles[-1]["close"]  # used for RSI/MACD/EMA calculation — can lag by hours for thin coins
 
             if isinstance(result.signal, str):
                 signal_str = result.signal.lower()
@@ -370,7 +370,15 @@ async def process_user(user, db):
                     )
                     continue
 
-                qty = round(trade_amount / current_price, 8) if current_price > 0 else 0
+                # Use a genuinely LIVE price for the actual entry, not the (possibly hours-old)
+                # candle close — this is what the stop-loss/take-profit check compares against
+                # later, so entry and exit must both be measured the same way to avoid a false
+                # "instant stop-loss" from comparing stale vs. live prices.
+                coingecko_id = COINGECKO_IDS.get(symbol)
+                live_price = await get_price_any(symbol, coingecko_id)
+                entry_price = live_price if live_price > 0 else candle_price
+
+                qty = round(trade_amount / entry_price, 8) if entry_price > 0 else 0
 
                 trade = Trade(
                     user_id=user.id,
@@ -378,13 +386,13 @@ async def process_user(user, db):
                     symbol=symbol,
                     signal="buy",
                     confidence=result.confidence,
-                    price=current_price,
+                    price=entry_price,
                     quantity=qty,
                     total_usdt=trade_amount,
                     rsi=result.rsi,
                     macd=result.macd,
                     bb_position=result.bb_position,
-                    coingecko_id=COINGECKO_IDS.get(symbol),
+                    coingecko_id=coingecko_id,
                     status=TradeStatus.pending,
                     created_at=datetime.utcnow()
                 )
@@ -392,7 +400,8 @@ async def process_user(user, db):
                 user.paper_balance_usdt = current_balance - trade_amount
 
                 logger.info(
-                    f"✅ BOUGHT {symbol} @ ${current_price:,.2f} "
+                    f"✅ BOUGHT {symbol} @ ${entry_price:,.2f} (live) "
+                    f"[candle close was ${candle_price:,.2f}] "
                     f"qty={qty} amount=${trade_amount:.2f} "
                     f"(balance now ${user.paper_balance_usdt:.2f})"
                 )
@@ -402,11 +411,15 @@ async def process_user(user, db):
                     logger.info(f"Sell signal for {symbol} ignored — no open position to close (spot-only, no shorting)")
                     continue
 
+                coingecko_id = open_trade.coingecko_id or COINGECKO_IDS.get(symbol)
+                live_price = await get_price_any(symbol, coingecko_id)
+                exit_price = live_price if live_price > 0 else candle_price
+
                 entry = float(open_trade.price or 0)
                 qty = float(open_trade.quantity or 0)
-                pnl = (current_price - entry) * qty
+                pnl = (exit_price - entry) * qty
 
-                open_trade.exit_price = current_price
+                open_trade.exit_price = exit_price
                 open_trade.pnl_usdt = round(pnl, 4)
                 open_trade.status = TradeStatus.executed
                 open_trade.executed_at = datetime.utcnow()
@@ -416,7 +429,7 @@ async def process_user(user, db):
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 logger.info(
-                    f"{emoji} SOLD {symbol} @ ${current_price:,.2f} — closed position (signal), "
+                    f"{emoji} SOLD {symbol} @ ${exit_price:,.2f} (live) — closed position (signal), "
                     f"P&L=${pnl:+.4f} (balance now ${user.paper_balance_usdt:.2f})"
                 )
 
