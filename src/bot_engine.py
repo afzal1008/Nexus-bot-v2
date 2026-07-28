@@ -502,6 +502,7 @@ async def process_user(user, db):
                 open_trade.pnl_usdt = round(pnl, 4)
                 open_trade.status = TradeStatus.executed
                 open_trade.executed_at = datetime.utcnow()
+                open_trade.close_reason = "signal"
 
                 principal = float(open_trade.total_usdt or 0)
                 user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
@@ -578,6 +579,7 @@ async def check_stop_loss_take_profit():
                 trade.pnl_usdt = round(pnl, 4)
                 trade.status = TradeStatus.executed
                 trade.executed_at = datetime.utcnow()
+                trade.close_reason = "stop_loss" if hit_stop else "take_profit"
 
                 if user:
                     principal = float(trade.total_usdt or 0)
@@ -651,6 +653,7 @@ async def auto_close_trades():
                 trade.pnl_usdt = round(pnl, 4)
                 trade.status = TradeStatus.executed
                 trade.executed_at = datetime.utcnow()
+                trade.close_reason = "timeout_4h"
 
                 user_result = await db.execute(select(User).where(User.id == trade.user_id))
                 user = user_result.scalar_one_or_none()
