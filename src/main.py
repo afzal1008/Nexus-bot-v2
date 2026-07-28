@@ -160,6 +160,7 @@ async def bot_history(
             "quantity": float(t.quantity or 0),
             "total_usdt": float(t.total_usdt or 0),
             "pnl_usdt": float(t.pnl_usdt) if t.pnl_usdt is not None else None,
+            "close_reason": t.close_reason,
             "status": t.status.value if hasattr(t.status, 'value') else str(t.status),
             "created_at": t.created_at.isoformat() if t.created_at else None
         }
