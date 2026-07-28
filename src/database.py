@@ -122,6 +122,7 @@ class Trade(Base):
     coingecko_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # saved at open time so price lookups survive restarts
     stop_loss_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)    # ATR-based, set at open time
     take_profit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # ATR-based, set at open time
+    close_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # signal | stop_loss | take_profit | timeout_4h | manual
 
     rsi: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     macd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -196,6 +197,9 @@ async def run_migrations():
         ))
         await conn.execute(text(
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR"
         ))
 
 async def get_db():
