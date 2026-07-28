@@ -145,6 +145,7 @@ async def manual_trade(
         open_trade.status = TradeStatus.executed
         open_trade.pnl_usdt = round(pnl, 4)
         open_trade.executed_at = datetime.utcnow()
+        open_trade.close_reason = "manual"
 
         principal = float(open_trade.total_usdt or 0)
         current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
@@ -234,6 +235,7 @@ async def close_trade(
     trade.status = TradeStatus.executed
     trade.pnl_usdt = round(pnl, 4)
     trade.executed_at = datetime.utcnow()
+    trade.close_reason = "manual"
 
     principal = float(trade.total_usdt or 0)
     current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
