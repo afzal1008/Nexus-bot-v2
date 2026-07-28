@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from database import get_db, User, Trade, TradeStatus, TradeSignal
+from sqlalchemy import select as sa_select
 from routers.auth import get_current_user
 from datetime import datetime, timedelta
 
@@ -89,6 +90,16 @@ async def dashboard_summary(
         for t in recent
     ]
 
+    # Breakdown of WHY closed trades closed — helps distinguish "overtrading with quick
+    # stop-losses" from "signals reversing" from "positions timing out unattended"
+    result = await db.execute(
+        select(Trade.close_reason, func.count(Trade.id))
+        .where(Trade.user_id == current_user.id)
+        .where(Trade.status == TradeStatus.executed)
+        .group_by(Trade.close_reason)
+    )
+    close_reason_breakdown = {(reason or "unknown"): count for reason, count in result.all()}
+
     actual_balance = float(current_user.paper_balance_usdt if current_user.paper_balance_usdt is not None else STARTING_BALANCE_USDT)
     # What the balance SHOULD be, computed independently from trade history —
     # lets you spot any drift between this and the stored value.
@@ -111,5 +122,6 @@ async def dashboard_summary(
             "stored_balance": actual_balance,
             "drift": round(actual_balance - expected_balance, 4),
         },
+        "close_reason_breakdown": close_reason_breakdown,
         "recent_signals": recent_signals,
     }
