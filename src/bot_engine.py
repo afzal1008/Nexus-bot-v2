@@ -78,25 +78,15 @@ LOCK_RISK_CHECK = 987002
 LOCK_AUTO_CLOSE = 987003
 
 
-async def try_acquire_lock(lock_id: int):
-    """Try to grab a Postgres session-level advisory lock. Returns (acquired, connection).
-    If acquired is False, another instance already holds this lock — caller should skip
-    this run rather than execute concurrently. The connection must be released via
-    release_lock() using the SAME connection object, since advisory locks are tied to it."""
-    from database import engine
+async def try_acquire_xact_lock(conn, lock_id: int) -> bool:
+    """Try to grab a Postgres TRANSACTION-scoped advisory lock on an already-open
+    connection/transaction. Unlike a session-scoped lock, this is guaranteed by Postgres
+    to auto-release the instant the transaction ends (commit or rollback) — no explicit
+    unlock call needed, and no risk of a connection-pooling edge case leaving it stuck
+    forever (which is what a session-scoped lock is vulnerable to)."""
     from sqlalchemy import text
-    conn = await engine.connect()
-    result = await conn.execute(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-    acquired = bool(result.scalar())
-    return acquired, conn
-
-
-async def release_lock(lock_id: int, conn):
-    from sqlalchemy import text
-    try:
-        await conn.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
-    finally:
-        await conn.close()
+    result = await conn.execute(text("SELECT pg_try_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+    return bool(result.scalar())
 
 
 class SchedulerManager:
@@ -327,12 +317,6 @@ async def fetch_top_gainers() -> list:
 
 
 async def bot_main_loop():
-    acquired, lock_conn = await try_acquire_lock(LOCK_BOT_MAIN_LOOP)
-    if not acquired:
-        logger.info("⏭️ bot_main_loop skipped — another instance is already running it (deploy overlap protection)")
-        await lock_conn.close()
-        return
-
     try:
         from database import get_db, User
         from sqlalchemy import select
@@ -341,6 +325,10 @@ async def bot_main_loop():
         db = await async_gen.__anext__()
 
         try:
+            if not await try_acquire_xact_lock(db, LOCK_BOT_MAIN_LOOP):
+                logger.info("⏭️ bot_main_loop skipped — another instance is already running it (deploy overlap protection)")
+                return
+
             result = await db.execute(
                 select(User).where(User.bot_enabled == True)
             )
@@ -370,8 +358,6 @@ async def bot_main_loop():
 
     except Exception as e:
         logger.error(f"❌ Bot loop error: {e}", exc_info=True)
-    finally:
-        await release_lock(LOCK_BOT_MAIN_LOOP, lock_conn)
 
 
 def compute_atr_levels(entry_price: float, atr_pct: float, user_stop_cap_pct: float, user_target_cap_pct: float):
@@ -521,12 +507,6 @@ async def check_stop_loss_take_profit():
     """Runs every 60s for ALL open positions across ALL users, independent of the technical
     signal. Uses each trade's own ATR-based stop/target price if set; falls back to the
     user's fixed percentage for any older trade that predates the ATR feature."""
-    acquired, lock_conn = await try_acquire_lock(LOCK_RISK_CHECK)
-    if not acquired:
-        logger.info("⏭️ check_stop_loss_take_profit skipped — another instance is already running it")
-        await lock_conn.close()
-        return
-
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select
@@ -535,6 +515,10 @@ async def check_stop_loss_take_profit():
         db = await async_gen.__anext__()
 
         try:
+            if not await try_acquire_xact_lock(db, LOCK_RISK_CHECK):
+                logger.info("⏭️ check_stop_loss_take_profit skipped — another instance is already running it")
+                return
+
             result = await db.execute(select(Trade).where(Trade.status == TradeStatus.pending))
             open_trades = result.scalars().all()
             if not open_trades:
@@ -603,18 +587,10 @@ async def check_stop_loss_take_profit():
 
     except Exception as e:
         logger.error(f"Stop-loss/take-profit check error: {e}", exc_info=True)
-    finally:
-        await release_lock(LOCK_RISK_CHECK, lock_conn)
 
 
 async def auto_close_trades():
     """Final safety net: force-close any position still open after 4 hours, settle wallet."""
-    acquired, lock_conn = await try_acquire_lock(LOCK_AUTO_CLOSE)
-    if not acquired:
-        logger.info("⏭️ auto_close_trades skipped — another instance is already running it")
-        await lock_conn.close()
-        return
-
     try:
         from database import get_db, Trade, TradeStatus, User
         from sqlalchemy import select, and_
@@ -623,6 +599,10 @@ async def auto_close_trades():
         db = await async_gen.__anext__()
 
         try:
+            if not await try_acquire_xact_lock(db, LOCK_AUTO_CLOSE):
+                logger.info("⏭️ auto_close_trades skipped — another instance is already running it")
+                return
+
             cutoff = datetime.utcnow() - timedelta(hours=4)
             result = await db.execute(
                 select(Trade).where(
@@ -672,5 +652,3 @@ async def auto_close_trades():
 
     except Exception as e:
         logger.error(f"Auto-close error: {e}", exc_info=True)
-    finally:
-        await release_lock(LOCK_AUTO_CLOSE, lock_conn)
