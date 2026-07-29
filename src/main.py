@@ -167,9 +167,14 @@ async def bot_history(
         for t in trades
     ]
 
+# Bump this string every time you deploy a new batch of files — lets you confirm
+# from /health (or the browser console) that the latest code is actually live,
+# without having to dig through Render logs or compare commit hashes.
+BUILD_VERSION = "2026-07-29-close-reason-consent-atr-locks"
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "nexus-bot-v2"}
+    return {"status": "ok", "service": "nexus-bot-v2", "build_version": BUILD_VERSION}
 
 @app.get("/")
 async def root():
