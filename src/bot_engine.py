@@ -37,7 +37,7 @@ MAX_GAINERS = 5              # allow more extra coins per loop
 
 MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
 STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
-MIN_CONFIDENCE_PCT = 40           # minimum signal confidence to act on (raised from 25)
+MIN_CONFIDENCE_PCT = 30           # minimum signal confidence to act on (lowered from 40 — that was producing zero trades for 3 days straight)
 
 DEFAULT_STOP_LOSS_PCT = 8.0     # fallback cap if a user has no value set — 8% loss
 DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback cap if a user has no value set — 15% gain
