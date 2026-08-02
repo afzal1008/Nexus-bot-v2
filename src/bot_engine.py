@@ -71,6 +71,36 @@ GAINERS_CACHE_SECONDS = 300
 _candles_cache = {}  # symbol -> {"data": [...], "fetched_at": datetime}
 CANDLES_CACHE_SECONDS = 300  # 5 minutes — avoids re-fetching full OHLC every 60s loop
 
+# Only these count as "a real exchange" for the listing-quality filter below.
+# CoinGecko tracks thousands of obscure/illiquid tokens (like FIGR_HELOC) that aren't
+# actually available to trade anywhere real — this filters those out of top gainers.
+MAJOR_EXCHANGES = {
+    "binance", "kraken", "coinbase-exchange", "okx", "bybit_spot",
+    "kucoin", "gate", "mexc_global", "huobi", "crypto_com"
+}
+
+_exchange_listing_cache = {}  # coingecko_id -> bool — listings rarely change, cache indefinitely per process
+
+
+async def is_listed_on_major_exchange(coingecko_id: str) -> bool:
+    """Check if a coin actually trades on at least one major, legitimate exchange.
+    Fails closed (returns False) if the check itself fails — better to skip a coin
+    we can't verify than risk trading an illiquid/obscure token."""
+    if coingecko_id in _exchange_listing_cache:
+        return _exchange_listing_cache[coingecko_id]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://api.coingecko.com/api/v3/coins/{coingecko_id}/tickers")
+            resp.raise_for_status()
+            data = resp.json()
+            tickers = data.get("tickers", [])
+            listed = any((t.get("market", {}) or {}).get("identifier", "") in MAJOR_EXCHANGES for t in tickers)
+            _exchange_listing_cache[coingecko_id] = listed
+            return listed
+    except Exception as e:
+        logger.warning(f"Exchange listing check failed for {coingecko_id}: {e}")
+        return False
+
 # Postgres advisory lock IDs — prevent the same scheduled job from running twice at once
 # across multiple app instances (e.g. during a Render deploy overlap window).
 LOCK_BOT_MAIN_LOOP = 987001
@@ -316,8 +346,12 @@ async def fetch_top_gainers() -> list:
             for coin in data:
                 symbol = coin["symbol"].upper() + "/USDT"
                 if symbol not in BASE_PAIRS and coin.get("price_change_percentage_24h", 0) > GAINER_THRESHOLD_PCT:
+                    coin_id = coin["id"]
+                    if not await is_listed_on_major_exchange(coin_id):
+                        logger.info(f"Skipping {symbol} — not listed on a major exchange (likely illiquid/obscure)")
+                        continue
                     gainers.append(symbol)
-                    COINGECKO_IDS[symbol] = coin["id"]
+                    COINGECKO_IDS[symbol] = coin_id
                     if len(gainers) >= MAX_GAINERS:
                         break
             if not gainers:
