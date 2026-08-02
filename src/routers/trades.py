@@ -12,7 +12,7 @@ from routers.auth import get_current_user
 from bot_engine import (
     KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT, get_price_any, resolve_coingecko_id,
     fetch_candles, compute_atr_levels, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
-    adjust_balance
+    adjust_balance, try_close_trade
 )
 from signal_engine import calculate_atr
 from pydantic import BaseModel
@@ -143,11 +143,10 @@ async def manual_trade(
         quantity = float(open_trade.quantity or 0)
         pnl = (current_price - entry_price) * quantity
 
-        open_trade.exit_price = current_price
-        open_trade.status = TradeStatus.executed
-        open_trade.pnl_usdt = round(pnl, 4)
-        open_trade.executed_at = datetime.utcnow()
-        open_trade.close_reason = "manual"
+        won = await try_close_trade(db, open_trade.id, current_price, pnl, "manual")
+        if not won:
+            await db.commit()
+            raise HTTPException(status_code=409, detail="This position was already closed by another process a moment ago.")
 
         principal = float(open_trade.total_usdt or 0)
         await adjust_balance(db, current_user.id, principal + pnl)
@@ -234,11 +233,10 @@ async def close_trade(
     quantity = float(trade.quantity or 0)
     pnl = (current_price - entry_price) * quantity  # spot-only: always long
 
-    trade.exit_price = current_price
-    trade.status = TradeStatus.executed
-    trade.pnl_usdt = round(pnl, 4)
-    trade.executed_at = datetime.utcnow()
-    trade.close_reason = "manual"
+    won = await try_close_trade(db, trade.id, current_price, pnl, "manual")
+    if not won:
+        await db.commit()
+        raise HTTPException(status_code=409, detail="This position was already closed by another process a moment ago.")
 
     principal = float(trade.total_usdt or 0)
     await adjust_balance(db, current_user.id, principal + pnl)
