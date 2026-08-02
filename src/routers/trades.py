@@ -11,7 +11,8 @@ from database import get_db, User, Trade, TradeStatus, TradeSignal
 from routers.auth import get_current_user
 from bot_engine import (
     KRAKEN_PAIRS, COINGECKO_IDS, MIN_TRADE_USDT, get_price_any, resolve_coingecko_id,
-    fetch_candles, compute_atr_levels, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT
+    fetch_candles, compute_atr_levels, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+    adjust_balance
 )
 from signal_engine import calculate_atr
 from pydantic import BaseModel
@@ -113,7 +114,8 @@ async def manual_trade(
             created_at=datetime.utcnow()
         )
         db.add(trade)
-        current_user.paper_balance_usdt = current_balance - body.amount_usdt
+        await adjust_balance(db, current_user.id, -body.amount_usdt)
+        current_user.paper_balance_usdt = current_balance - body.amount_usdt  # local estimate for the response below
         await db.commit()
 
         logger.info(f"Manual BUY by {current_user.email}: {body.symbol} qty={quantity} @ ${price}")
@@ -148,7 +150,8 @@ async def manual_trade(
         open_trade.close_reason = "manual"
 
         principal = float(open_trade.total_usdt or 0)
-        current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
+        await adjust_balance(db, current_user.id, principal + pnl)
+        current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl  # local estimate for the response below
         await db.commit()
 
         return {
@@ -238,7 +241,8 @@ async def close_trade(
     trade.close_reason = "manual"
 
     principal = float(trade.total_usdt or 0)
-    current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl
+    await adjust_balance(db, current_user.id, principal + pnl)
+    current_user.paper_balance_usdt = float(current_user.paper_balance_usdt or 0) + principal + pnl  # local estimate for the response below
 
     await db.commit()
 
