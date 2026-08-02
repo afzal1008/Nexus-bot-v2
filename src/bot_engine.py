@@ -133,6 +133,30 @@ async def adjust_balance(db, user_id: str, delta: float):
     )
 
 
+async def try_close_trade(db, trade_id: str, exit_price: float, pnl: float, close_reason: str) -> bool:
+    """Atomically closes a trade ONLY IF it is still 'pending' at the moment this runs —
+    an UPDATE ... WHERE status='pending' that only succeeds once, no matter how many
+    processes race to close the same trade at the same time. Returns True if THIS call
+    won the race (caller should apply the wallet credit), False if another process
+    already closed it a moment earlier (caller must NOT credit the wallet again — this
+    is what prevents the same close being paid out twice, which was causing balance
+    to drift UP instead of down)."""
+    from database import Trade, TradeStatus
+    from sqlalchemy import update
+    result = await db.execute(
+        update(Trade)
+        .where(Trade.id == trade_id, Trade.status == TradeStatus.pending)
+        .values(
+            exit_price=exit_price,
+            pnl_usdt=round(pnl, 4),
+            status=TradeStatus.executed,
+            executed_at=datetime.utcnow(),
+            close_reason=close_reason
+        )
+    )
+    return result.rowcount > 0
+
+
 class SchedulerManager:
     def __init__(self):
         self.scheduler = None
@@ -147,11 +171,11 @@ class SchedulerManager:
             check_stop_loss_take_profit, "interval", seconds=60,
             id="nexus-risk-check", replace_existing=True
         )
-        self.scheduler.add_job(
-            auto_close_trades, "interval", minutes=10,
-            id="nexus-auto-close", replace_existing=True
-        )
-        logger.info("✅ Bot scheduler started - signal loop + risk check every 60s")
+        # 4-hour auto-close is intentionally NOT scheduled anymore — positions now only
+        # close via their stop-loss/take-profit price, with no time-based force-close.
+        # The auto_close_trades() function is left defined below in case you want to
+        # re-enable it later as a longer-term safety net (e.g. weeks, not hours).
+        logger.info("✅ Bot scheduler started - signal loop + risk check every 60s (no 4h timeout)")
 
 
 scheduler_manager = SchedulerManager()
@@ -533,21 +557,17 @@ async def process_user(user, db):
                 qty = float(open_trade.quantity or 0)
                 pnl = (exit_price - entry) * qty
 
-                open_trade.exit_price = exit_price
-                open_trade.pnl_usdt = round(pnl, 4)
-                open_trade.status = TradeStatus.executed
-                open_trade.executed_at = datetime.utcnow()
-                open_trade.close_reason = "signal"
-
-                principal = float(open_trade.total_usdt or 0)
-                await adjust_balance(db, user.id, principal + pnl)
-                user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl  # local estimate for logging
-
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                logger.info(
-                    f"{emoji} SOLD {symbol} @ ${exit_price:,.2f} (live) — closed position (signal), "
-                    f"P&L=${pnl:+.4f} (balance now ${user.paper_balance_usdt:.2f})"
-                )
+                won = await try_close_trade(db, open_trade.id, exit_price, pnl, "signal")
+                if won:
+                    principal = float(open_trade.total_usdt or 0)
+                    await adjust_balance(db, user.id, principal + pnl)
+                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    logger.info(
+                        f"{emoji} SOLD {symbol} @ ${exit_price:,.2f} (live) — closed position (signal), "
+                        f"P&L=${pnl:+.4f}"
+                    )
+                else:
+                    logger.info(f"{symbol} already closed by another process — skipping duplicate credit")
 
         except Exception as e:
             logger.error(f"Error for {symbol}: {e}", exc_info=True)
@@ -608,12 +628,12 @@ async def check_stop_loss_take_profit():
 
                 qty = float(trade.quantity or 0)
                 pnl = (current_price - entry) * qty
+                reason_key = "stop_loss" if hit_stop else "take_profit"
 
-                trade.exit_price = current_price
-                trade.pnl_usdt = round(pnl, 4)
-                trade.status = TradeStatus.executed
-                trade.executed_at = datetime.utcnow()
-                trade.close_reason = "stop_loss" if hit_stop else "take_profit"
+                won = await try_close_trade(db, trade.id, current_price, pnl, reason_key)
+                if not won:
+                    logger.info(f"{trade.symbol} already closed by another process — skipping duplicate credit")
+                    continue
 
                 if user:
                     principal = float(trade.total_usdt or 0)
