@@ -76,6 +76,11 @@ class User(Base):
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=8.0)
     take_profit_pct: Mapped[float] = mapped_column(Float, default=15.0)
 
+    # Risk disclosure consent — required at signup, logged for audit purposes
+    consent_accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    consent_accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    consent_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -165,42 +170,40 @@ async def init_db():
     await run_migrations()
 
 
+MIGRATION_STATEMENTS = [
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS paper_balance_usdt DOUBLE PRECISION DEFAULT 10000",
+    "UPDATE users SET paper_balance_usdt = 10000 WHERE paper_balance_usdt IS NULL",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS stop_loss_pct DOUBLE PRECISION DEFAULT 8.0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS take_profit_pct DOUBLE PRECISION DEFAULT 15.0",
+    "UPDATE users SET stop_loss_pct = 8.0 WHERE stop_loss_pct IS NULL",
+    "UPDATE users SET take_profit_pct = 15.0 WHERE take_profit_pct IS NULL",
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS coingecko_id VARCHAR",
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss_price DOUBLE PRECISION",
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION",
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_accepted BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_accepted_at TIMESTAMP",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_version VARCHAR",
+]
+
+
 async def run_migrations():
-    """Lightweight, safe migrations for columns added after initial deploy."""
-    async with engine.begin() as conn:
-        await conn.execute(text(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS paper_balance_usdt DOUBLE PRECISION DEFAULT 10000"
-        ))
-        await conn.execute(text(
-            "UPDATE users SET paper_balance_usdt = 10000 WHERE paper_balance_usdt IS NULL"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS stop_loss_pct DOUBLE PRECISION DEFAULT 8.0"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS take_profit_pct DOUBLE PRECISION DEFAULT 15.0"
-        ))
-        await conn.execute(text(
-            "UPDATE users SET stop_loss_pct = 8.0 WHERE stop_loss_pct IS NULL"
-        ))
-        await conn.execute(text(
-            "UPDATE users SET take_profit_pct = 15.0 WHERE take_profit_pct IS NULL"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS coingecko_id VARCHAR"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss_price DOUBLE PRECISION"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR"
-        ))
+    """Lightweight, safe migrations for columns added after initial deploy.
+    Each statement runs in its own short transaction with a short lock_timeout —
+    if the old app instance is still live during a deploy and holding a conflicting
+    lock, this fails fast and safely (logged, skipped) instead of deadlocking and
+    crashing a live request. IF NOT EXISTS makes every statement safe to simply
+    retry on the next deploy if it gets skipped this time."""
+    import logging
+    logger = logging.getLogger(__name__)
+    for stmt in MIGRATION_STATEMENTS:
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET lock_timeout = '5s'"))
+                await conn.execute(text(stmt))
+        except Exception as e:
+            logger.warning(f"Migration statement skipped this boot (will retry next deploy): {stmt} — {e}")
 
 async def get_db():
     async with AsyncSessionLocal() as session:
