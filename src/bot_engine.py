@@ -89,6 +89,20 @@ async def try_acquire_xact_lock(conn, lock_id: int) -> bool:
     return bool(result.scalar())
 
 
+async def adjust_balance(db, user_id: str, delta: float):
+    """Atomically adjust a user's paper wallet balance directly in the database
+    (SET balance = balance + delta in a single statement), instead of reading the
+    value into Python, changing it, and writing it back. This is what actually prevents
+    the wallet drift bug: two overlapping processes doing read-then-write can silently
+    overwrite each other's change (a 'lost update'); an atomic DB-side increment cannot
+    be lost this way no matter how many processes touch it concurrently."""
+    from database import User
+    from sqlalchemy import update
+    await db.execute(
+        update(User).where(User.id == user_id).values(paper_balance_usdt=User.paper_balance_usdt + delta)
+    )
+
+
 class SchedulerManager:
     def __init__(self):
         self.scheduler = None
@@ -461,7 +475,8 @@ async def process_user(user, db):
                     created_at=datetime.utcnow()
                 )
                 db.add(trade)
-                user.paper_balance_usdt = current_balance - trade_amount
+                await adjust_balance(db, user.id, -trade_amount)
+                user.paper_balance_usdt = current_balance - trade_amount  # local estimate for this cycle's logging only
 
                 logger.info(
                     f"✅ BOUGHT {symbol} @ ${entry_price:,.2f} (live) "
@@ -491,7 +506,8 @@ async def process_user(user, db):
                 open_trade.close_reason = "signal"
 
                 principal = float(open_trade.total_usdt or 0)
-                user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
+                await adjust_balance(db, user.id, principal + pnl)
+                user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl  # local estimate for logging
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 logger.info(
@@ -567,7 +583,7 @@ async def check_stop_loss_take_profit():
 
                 if user:
                     principal = float(trade.total_usdt or 0)
-                    user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
+                    await adjust_balance(db, user.id, principal + pnl)
 
                 change_pct_display = ((current_price - entry) / entry) * 100
                 reason = "STOP-LOSS" if hit_stop else "TAKE-PROFIT"
@@ -639,7 +655,7 @@ async def auto_close_trades():
                 user = user_result.scalar_one_or_none()
                 if user:
                     principal = float(trade.total_usdt or 0)
-                    user.paper_balance_usdt = float(user.paper_balance_usdt or 0) + principal + pnl
+                    await adjust_balance(db, user.id, principal + pnl)
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 logger.info(f"{emoji} Auto-closed {trade.symbol}: ${pnl:+.4f} USDT")
