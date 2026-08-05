@@ -17,6 +17,7 @@ from bot_engine import (
 from signal_engine import calculate_atr
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,9 @@ class ManualTradeRequest(BaseModel):
     symbol: str          # e.g. "BTC/USDT"
     action: str          # "buy" or "sell"
     amount_usdt: float   # how much paper USDT to use (ignored for "sell" — uses the open position's size)
+    coingecko_id: Optional[str] = None  # pass this when the frontend already knows the exact coin —
+                                          # some symbols (e.g. "PUMP") collide across multiple different
+                                          # coins on CoinGecko; re-guessing by symbol alone can pick the wrong one
 
 
 async def get_current_price(symbol: str, coingecko_id: str = None) -> float:
@@ -79,9 +83,13 @@ async def manual_trade(
                 detail=f"Insufficient paper balance: ${current_balance:.2f} available, ${body.amount_usdt:.2f} requested"
             )
 
-        coin_id = COINGECKO_IDS.get(body.symbol)
+        # Prefer the exact coin id the frontend already knew (avoids symbol collisions
+        # like "PUMP" matching the wrong coin), only guess if it wasn't provided.
+        coin_id = body.coingecko_id or COINGECKO_IDS.get(body.symbol)
         if not coin_id:
             coin_id = await resolve_coingecko_id(body.symbol)
+        elif body.symbol not in COINGECKO_IDS:
+            COINGECKO_IDS[body.symbol] = coin_id  # cache it for next time (bot loop, close, etc.)
 
         price = await get_current_price(body.symbol, coin_id)
         quantity = round(body.amount_usdt / price, 8)
