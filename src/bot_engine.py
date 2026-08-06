@@ -38,6 +38,10 @@ MAX_GAINERS = 5              # allow more extra coins per loop
 MIN_TRADE_USDT = 500.0            # minimum paper allocation per trade
 STARTING_BALANCE_USDT = 10000.0   # starting/reference paper wallet size
 MIN_CONFIDENCE_PCT = 30           # minimum signal confidence to act on (lowered from 40 — that was producing zero trades for 3 days straight)
+MIN_HOLD_MINUTES = 15             # a signal-reversal close must wait at least this long after entry —
+                                   # prevents rapid buy/sell/re-buy flapping from noisy signals near the
+                                   # confidence floor. Stop-loss/take-profit are NOT subject to this —
+                                   # those are real risk events and always act immediately regardless of hold time.
 
 DEFAULT_STOP_LOSS_PCT = 8.0     # fallback cap if a user has no value set — 8% loss
 DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback cap if a user has no value set — 15% gain
@@ -547,6 +551,15 @@ async def process_user(user, db):
             elif signal_str == "sell":
                 if not open_trade:
                     logger.info(f"Sell signal for {symbol} ignored — no open position to close (spot-only, no shorting)")
+                    continue
+
+                held_minutes = (datetime.utcnow() - open_trade.created_at).total_seconds() / 60.0
+                if held_minutes < MIN_HOLD_MINUTES:
+                    logger.info(
+                        f"Sell signal for {symbol} ignored — held only {held_minutes:.1f}m, "
+                        f"minimum hold is {MIN_HOLD_MINUTES}m before a signal close is allowed "
+                        f"(stop-loss/take-profit still active regardless)"
+                    )
                     continue
 
                 coingecko_id = open_trade.coingecko_id or COINGECKO_IDS.get(symbol)
