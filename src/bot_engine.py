@@ -42,6 +42,11 @@ MIN_HOLD_MINUTES = 15             # a signal-reversal close must wait at least t
                                    # prevents rapid buy/sell/re-buy flapping from noisy signals near the
                                    # confidence floor. Stop-loss/take-profit are NOT subject to this —
                                    # those are real risk events and always act immediately regardless of hold time.
+CLOSE_CONFIDENCE_PCT = 45         # a sell signal needs THIS much confidence to close an existing position —
+                                   # higher than the 30% needed to OPEN one. Prevents range-bound markets
+                                   # (e.g. a coin oscillating in a tight band) from triggering constant
+                                   # low-conviction round-trip closes; weak reversals now just get ignored
+                                   # and the position rides until it hits its real stop-loss/take-profit instead.
 
 DEFAULT_STOP_LOSS_PCT = 8.0     # fallback cap if a user has no value set — 8% loss
 DEFAULT_TAKE_PROFIT_PCT = 15.0  # fallback cap if a user has no value set — 15% gain
@@ -479,7 +484,12 @@ async def process_user(user, db):
                 f"RSI={result.rsi} ADX={result.adx} ATR%={result.atr_pct}"
             )
 
-            if signal_str == "hold" or result.confidence < MIN_CONFIDENCE_PCT:
+            # Opening uses the lower MIN_CONFIDENCE_PCT bar; closing an existing position via
+            # signal needs the higher CLOSE_CONFIDENCE_PCT bar (checked below, per-branch),
+            # so we can't filter everything out here anymore for "sell" — only for "hold".
+            if signal_str == "hold":
+                continue
+            if signal_str == "buy" and result.confidence < MIN_CONFIDENCE_PCT:
                 continue
 
             existing = await db.execute(
@@ -551,6 +561,14 @@ async def process_user(user, db):
             elif signal_str == "sell":
                 if not open_trade:
                     logger.info(f"Sell signal for {symbol} ignored — no open position to close (spot-only, no shorting)")
+                    continue
+
+                if result.confidence < CLOSE_CONFIDENCE_PCT:
+                    logger.info(
+                        f"Sell signal for {symbol} ignored — conf={result.confidence}% is below the "
+                        f"{CLOSE_CONFIDENCE_PCT}% needed to close (range-bound noise filter; "
+                        f"stop-loss/take-profit still active regardless)"
+                    )
                     continue
 
                 held_minutes = (datetime.utcnow() - open_trade.created_at).total_seconds() / 60.0
